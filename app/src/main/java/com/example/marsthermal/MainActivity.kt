@@ -73,13 +73,23 @@ class MainActivity : AppCompatActivity() {
     private val rxBytes = AtomicLong(0)
     private val completions = AtomicLong(0)
     @Volatile private var readerMode = "-"
+    @Volatile private var framedMode = false       // false: кадры нарезаются по байтам; true: по границам "коротких" запросов
+    @Volatile private var asmReset = false
+    @Volatile private var relockRequest = false
+    @Volatile private var lastGap = 0L
+    @Volatile private var reqSizeUsed = 0
+    private val shortCount = AtomicInteger(0)
+    private val gapOk = AtomicInteger(0)
+    private val badFrames = AtomicInteger(0)
     @Volatile private var lastErr = ""
     private lateinit var debugView: TextView
     private val ticker = object : Runnable {
         override fun run() {
             debugView.text = "reader: $readerMode | ${rxBytes.get() / 1_000_000} МБ | " +
                     "запросов ${completions.get()} | кадров ${rxFrames.get()} | " +
-                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()}" +
+                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()}\n" +
+                    "коротких ${shortCount.get()} (длина=кадр: ${gapOk.get()}) | послед. длина $lastGap | " +
+                    "брак ${badFrames.get()} | режим: ${if (framedMode) "ПО КОРОТКИМ" else "по байтам"} (тап по экрану)" +
                     (if (lastErr.isNotEmpty()) "\nОШИБКА: $lastErr" else "")
             handler.postDelayed(this, 500)
         }
@@ -105,6 +115,11 @@ class MainActivity : AppCompatActivity() {
         image = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
             setBackgroundColor(Color.BLACK)
+        }
+        image.setOnClickListener {
+            framedMode = !framedMode
+            asmReset = true
+            relockRequest = true
         }
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
@@ -198,6 +213,10 @@ class MainActivity : AppCompatActivity() {
         completions.set(0)
         lastErr = ""
         readerMode = "старт"
+        shortCount.set(0)
+        gapOk.set(0)
+        badFrames.set(0)
+        lastGap = 0
         readerThread = thread(name = "usb-reader") { readerLoop(dev) }
         workerThread = thread(name = "decoder") { workerLoop() }
     }
@@ -223,12 +242,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Собирает поток байт в кадры по FRAME_BYTES. */
+    /** Собирает поток в кадры по FRAME_BYTES. */
     private inner class Assembler {
         private var cur = obtain()
         private var curLen = 0
+        private var overflow = false
 
-        fun reset() { curLen = 0 }
+        fun reset() { curLen = 0; overflow = false }
 
         private fun advance(take: Int) {
             curLen += take
@@ -240,6 +260,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** Режим "по байтам": кадр = каждые FRAME_BYTES байт подряд. */
         fun feed(b: ByteBuffer, n: Int) {
             var off = 0
             while (off < n) {
@@ -257,6 +278,31 @@ class MainActivity : AppCompatActivity() {
                 System.arraycopy(b, start + off, cur, curLen, take)
                 off += take
                 advance(take)
+            }
+        }
+
+        /**
+         * Режим "по коротким": короткое завершение запроса считаем концом передачи (кадра).
+         * Кадр принимается, только если его длина ровно FRAME_BYTES, иначе он бракуется.
+         */
+        fun feedFramed(b: ByteBuffer, n: Int, isShort: Boolean) {
+            val room = ThermalDecoder.FRAME_BYTES - curLen
+            if (!overflow && n <= room) {
+                if (n > 0) b.get(cur, curLen, n)
+                curLen += n
+            } else {
+                overflow = true
+            }
+            if (isShort) {
+                if (!overflow && curLen == ThermalDecoder.FRAME_BYTES) {
+                    publish(cur)
+                    rxFrames.incrementAndGet()
+                    cur = obtain()
+                } else {
+                    badFrames.incrementAndGet()
+                }
+                curLen = 0
+                overflow = false
             }
         }
     }
@@ -297,12 +343,19 @@ class MainActivity : AppCompatActivity() {
             }
 
             val asm = Assembler()
-            readerMode = "async"
-            val asyncOk = try {
-                runAsync(conn, endpoint, asm)
-            } catch (t: Throwable) {
-                lastErr = "async: $t"
-                false
+            var asyncOk = false
+            for (size in intArrayOf(65536, 16384)) {
+                if (!running) break
+                readerMode = "async ${size / 1024}K"
+                reqSizeUsed = size
+                asm.reset()
+                asyncOk = try {
+                    runAsync(conn, endpoint, asm, size)
+                } catch (t: Throwable) {
+                    lastErr = "async ${size / 1024}K: $t"
+                    false
+                }
+                if (asyncOk) break
             }
             if (running && !asyncOk) {
                 readerMode = "sync (запасной)"
@@ -317,22 +370,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Асинхронная очередь UsbRequest: всегда висит REQ_COUNT запросов, пауз между ними нет. */
-    private fun runAsync(conn: UsbDeviceConnection, ep: UsbEndpoint, asm: Assembler): Boolean {
-        val bufs = Array(REQ_COUNT) { ByteBuffer.allocateDirect(REQ_SIZE) }
+    /** Асинхронная очередь UsbRequest: всегда висит ~1 МБ запросов, пауз между ними нет. */
+    private fun runAsync(conn: UsbDeviceConnection, ep: UsbEndpoint, asm: Assembler, reqSize: Int): Boolean {
+        val count = (1 shl 20) / reqSize
+        val bufs = Array(count) { ByteBuffer.allocateDirect(reqSize) }
         val reqs = ArrayList<UsbRequest>()
         try {
-            for (i in 0 until REQ_COUNT) {
+            for (i in 0 until count) {
                 val r = UsbRequest()
                 if (!r.initialize(conn, ep)) { lastErr = "UsbRequest.initialize не удался"; return false }
                 r.clientData = i
                 reqs.add(r)
                 bufs[i].clear()
-                if (!r.queue(bufs[i])) { lastErr = "queue() не удался при старте"; return false }
+                if (!r.queue(bufs[i])) { lastErr = "queue() не удался при старте (${reqSize / 1024}K)"; return false }
             }
             val t0 = System.currentTimeMillis()
             var gotAny = false
+            var sinceShort = 0L
             while (running) {
+                if (asmReset) { asm.reset(); sinceShort = 0; asmReset = false }
                 val done: UsbRequest? = try {
                     conn.requestWait(200)
                 } catch (e: TimeoutException) {
@@ -340,7 +396,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (done == null) {
                     if (!gotAny && System.currentTimeMillis() - t0 > 2500) {
-                        lastErr = "async: за 2.5 с ни один запрос не завершился"
+                        lastErr = "async ${reqSize / 1024}K: за 2.5 с ни один запрос не завершился"
                         return false
                     }
                     continue
@@ -348,12 +404,24 @@ class MainActivity : AppCompatActivity() {
                 gotAny = true
                 completions.incrementAndGet()
                 val b = bufs[done.clientData as Int]
+                // position() после завершения = число принятых байт (0 = пустой пакет, это НЕ полный буфер)
                 var n = b.position()
-                if (n <= 0 || n > REQ_SIZE) n = REQ_SIZE
+                if (n < 0) n = 0
+                if (n > reqSize) n = reqSize
                 rxBytes.addAndGet(n.toLong())
+                val isShort = n < reqSize
+
+                sinceShort += n
+                if (isShort) {
+                    shortCount.incrementAndGet()
+                    lastGap = sinceShort
+                    if (sinceShort == ThermalDecoder.FRAME_BYTES.toLong()) gapOk.incrementAndGet()
+                    sinceShort = 0
+                }
+
                 b.position(0)
                 b.limit(n)
-                asm.feed(b, n)
+                if (framedMode) asm.feedFramed(b, n, isShort) else if (n > 0) asm.feed(b, n)
                 b.clear()
                 if (!done.queue(b)) { lastErr = "queue() не удался в цикле"; return false }
             }
@@ -407,6 +475,7 @@ class MainActivity : AppCompatActivity() {
         var statText = ""
 
         while (running) {
+            if (relockRequest) { shift = -1; pending = -1; relockRequest = false }
             val f = ready.poll(200, TimeUnit.MILLISECONDS) ?: continue
             try {
                 val t0 = System.nanoTime()
