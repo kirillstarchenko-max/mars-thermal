@@ -47,8 +47,9 @@ class MainActivity : AppCompatActivity() {
         const val EQUALIZE = true
         const val REQ_SIZE = 16384          // размер одного USB-запроса
         const val REQ_COUNT = 64            // (не используется, оставлено для совместимости)
+        const val STALL_MS = 4000L          // сколько камера может молчать (одни пустые пакеты), прежде чем переподключаться
         const val BENCH_MS = 5000L          // длительность одного замера
-        const val BENCH_ROUNDS = 2          // сколько кругов замеров
+        const val BENCH_ROUNDS = 0          // кругов замера скорости (0 = выключено, сразу рабочий режим A64K); 2 = включить замер
         private val STRATS = listOf(
             Strategy("A64K", true, 65536),
             Strategy("A256K", true, 262144),
@@ -84,6 +85,8 @@ class MainActivity : AppCompatActivity() {
     private val completions = AtomicLong(0)
     @Volatile private var readerMode = "-"
     @Volatile private var benchText = ""
+    @Volatile private var stalled = false
+    private val recoveries = AtomicInteger(0)
     @Volatile private var framedMode = false       // false: кадры нарезаются по байтам; true: по границам "коротких" запросов
     @Volatile private var asmReset = false
     @Volatile private var autoDecided = false      // авто-выбор режима уже сделан (или пользователь тапнул)
@@ -99,7 +102,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             debugView.text = "reader: $readerMode | ${rxBytes.get() / 1_000_000} МБ | " +
                     "запросов ${completions.get()} | кадров ${rxFrames.get()} | " +
-                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()}\n" +
+                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()} | переподк. ${recoveries.get()}\n" +
                     "коротких ${shortCount.get()} (длина=кадр: ${gapOk.get()}) | послед. длина $lastGap | " +
                     "брак ${badFrames.get()} | режим: ${if (framedMode) "ПО КОРОТКИМ" else "по байтам"}\n" +
                     "замер МБ/с: ${if (benchText.isEmpty()) "ещё нет" else benchText}" +
@@ -228,6 +231,8 @@ class MainActivity : AppCompatActivity() {
         lastErr = ""
         readerMode = "старт"
         benchText = ""
+        recoveries.set(0)
+        stalled = false
         autoDecided = false
         framedMode = false
         shortCount.set(0)
@@ -324,14 +329,41 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun readerLoop(dev: UsbDevice) {
+    /** Внешний цикл: если камера замолчала или отвалилась, закрываем соединение и открываем заново. */
+    private fun readerLoop(first: UsbDevice) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        var dev: UsbDevice? = first
+        while (running) {
+            if (dev == null) {
+                lastErr = "камера не видна, жду..."
+                sleepMs(1000)
+                dev = findDevice()
+                continue
+            }
+            stalled = false
+            try {
+                readSession(dev)
+            } catch (t: Throwable) {
+                lastErr = "reader: $t"
+            }
+            if (!running) break
+            recoveries.incrementAndGet()
+            readerMode = "переподключение..."
+            sleepMs(800)
+            dev = findDevice()
+        }
+    }
+
+    private fun sleepMs(ms: Long) {
+        try { Thread.sleep(ms) } catch (_: InterruptedException) {}
+    }
+
+    private fun readSession(dev: UsbDevice) {
         try {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
 
             val conn = usb.openDevice(dev)
             if (conn == null) {
                 lastErr = "openDevice вернул null (нет разрешения?)"
-                running = false
                 return
             }
             var iface: UsbInterface? = null
@@ -348,16 +380,20 @@ class MainActivity : AppCompatActivity() {
             }
             if (iface == null || ep == null) {
                 lastErr = "Endpoint 0x81 не найден"
-                conn.close(); running = false
+                conn.close()
                 return
             }
             val endpoint: UsbEndpoint = ep
             val usbInterface: UsbInterface = iface
             if (!conn.claimInterface(usbInterface, true)) {
                 lastErr = "claimInterface не удался"
-                conn.close(); running = false
+                conn.close()
                 return
             }
+
+            // как clear_halt/set_interface в Python: сбрасываем состояние конечной точки перед чтением
+            try { conn.setInterface(usbInterface) } catch (_: Throwable) {}
+            try { conn.controlTransfer(0x02, 0x01, 0, EP_IN, null, 0, 1000) } catch (_: Throwable) {}
 
             val asm = Assembler()
             val sumMbps = DoubleArray(STRATS.size)
@@ -381,13 +417,13 @@ class MainActivity : AppCompatActivity() {
             for (i in STRATS.indices) {
                 if (cnt[i] > 0 && sumMbps[i] / cnt[i] > bestV) { bestV = sumMbps[i] / cnt[i]; best = i }
             }
-            if (best < 0) best = 2    // если замеры не удались, берём синхронное чтение 64K
+            if (best < 0) best = if (BENCH_ROUNDS == 0) 0 else 2   // без замеров: A64K; при неудачных замерах: S64K
             if (running) {
                 readerMode = "рабочий: ${STRATS[best].name}"
                 reqSizeUsed = STRATS[best].size
                 asm.reset(); relockRequest = true
                 val r = runStrategy(conn, endpoint, asm, STRATS[best], Long.MAX_VALUE)
-                if (r < 0 && running) {
+                if (r < 0 && running && !stalled) {
                     readerMode = "запасной: S64K"
                     asm.reset(); relockRequest = true
                     runStrategy(conn, endpoint, asm, STRATS[2], Long.MAX_VALUE)
@@ -397,7 +433,6 @@ class MainActivity : AppCompatActivity() {
             conn.close()
         } catch (t: Throwable) {
             lastErr = "reader: $t"
-            running = false
         }
     }
 
@@ -441,7 +476,13 @@ class MainActivity : AppCompatActivity() {
             val t0 = System.currentTimeMillis()
             var gotAny = false
             var sinceShort = 0L
+            var lastDataMs = System.currentTimeMillis()
             while (running && System.currentTimeMillis() < deadlineMs) {
+                if (gotAny && System.currentTimeMillis() - lastDataMs > STALL_MS) {
+                    stalled = true
+                    lastErr = "камера молчит ${STALL_MS / 1000} с (одни пустые пакеты)"
+                    return false
+                }
                 if (asmReset) { asm.reset(); sinceShort = 0; asmReset = false }
                 val done: UsbRequest? = try {
                     conn.requestWait(200)
@@ -463,6 +504,7 @@ class MainActivity : AppCompatActivity() {
                 if (n < 0) n = 0
                 if (n > reqSize) n = reqSize
                 rxBytes.addAndGet(n.toLong())
+                if (n > 0) lastDataMs = System.currentTimeMillis()
                 val isShort = n < reqSize
 
                 sinceShort += n
@@ -504,7 +546,13 @@ class MainActivity : AppCompatActivity() {
                         size: Int, deadlineMs: Long) {
         val chunk = ByteArray(size)
         var fails = 0
+        var lastDataMs = System.currentTimeMillis()
         while (running && System.currentTimeMillis() < deadlineMs) {
+            if (System.currentTimeMillis() - lastDataMs > STALL_MS) {
+                stalled = true
+                lastErr = "камера молчит ${STALL_MS / 1000} с (sync)"
+                return
+            }
             val n = conn.bulkTransfer(ep, chunk, chunk.size, 100)
             if (n < 0) {
                 if (++fails > 50) { lastErr = "sync: нет данных от камеры"; fails = 0 }
@@ -512,6 +560,7 @@ class MainActivity : AppCompatActivity() {
             }
             fails = 0
             if (n == 0) continue
+            lastDataMs = System.currentTimeMillis()
             completions.incrementAndGet()
             rxBytes.addAndGet(n.toLong())
             asm.feed(chunk, 0, n)
