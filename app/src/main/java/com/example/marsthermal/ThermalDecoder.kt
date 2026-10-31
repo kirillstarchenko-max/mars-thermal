@@ -105,6 +105,43 @@ object ThermalDecoder {
         }
     }
 
+    private fun rowStdFast(a: ShortArray, start0: Int): Double {
+        val start = start0 % VALUES
+        var s = 0L
+        var s2 = 0L
+        if (start + WIDTH <= VALUES) {
+            for (j in start until start + WIDTH) {
+                val x = a[j].toInt() and 0xFFFF
+                s += x
+                s2 += x.toLong() * x
+            }
+        } else {
+            for (j in 0 until WIDTH) {
+                val x = a[(start + j) % VALUES].toInt() and 0xFFFF
+                s += x
+                s2 += x.toLong() * x
+            }
+        }
+        val m = s.toDouble() / WIDTH
+        return sqrt(maxOf(0.0, s2.toDouble() / WIDTH - m * m))
+    }
+
+    /**
+     * Строгая проверка кадра при выбранном сдвиге: ВСЕ служебные строки (кроме последней)
+     * должны быть плоскими, а последняя (заголовок) — «живой». Рваный кадр (потеря данных
+     * внутри кадра) этой проверки не проходит, и его не показываем.
+     */
+    fun frameOk(a: ShortArray, shift: Int): Boolean {
+        var bad = 0
+        for (r in 0 until ROWS - 1) {
+            if (rowStdFast(a, shift + r * ROW) > 200.0) {
+                bad++
+                if (bad > 2) return false
+            }
+        }
+        return rowStdFast(a, shift + (ROWS - 1) * ROW) > 1000.0
+    }
+
     /** Служебная половина должна оставаться плоской; иначе фаза потеряна. */
     fun syncLost(a: ShortArray, shift: Int): Boolean {
         val s = DoubleArray(64)

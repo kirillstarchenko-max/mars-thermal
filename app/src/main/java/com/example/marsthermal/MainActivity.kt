@@ -87,6 +87,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var benchText = ""
     @Volatile private var stalled = false
     private val recoveries = AtomicInteger(0)
+    private val rejected = AtomicInteger(0)
     @Volatile private var framedMode = false       // false: кадры нарезаются по байтам; true: по границам "коротких" запросов
     @Volatile private var asmReset = false
     @Volatile private var autoDecided = false      // авто-выбор режима уже сделан (или пользователь тапнул)
@@ -102,7 +103,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             debugView.text = "reader: $readerMode | ${rxBytes.get() / 1_000_000} МБ | " +
                     "запросов ${completions.get()} | кадров ${rxFrames.get()} | " +
-                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()} | переподк. ${recoveries.get()}\n" +
+                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()} | переподк. ${recoveries.get()} | отброшено ${rejected.get()}\n" +
                     "коротких ${shortCount.get()} (длина=кадр: ${gapOk.get()}) | послед. длина $lastGap | " +
                     "брак ${badFrames.get()} | режим: ${if (framedMode) "ПО КОРОТКИМ" else "по байтам"}\n" +
                     "замер МБ/с: ${if (benchText.isEmpty()) "ещё нет" else benchText}" +
@@ -232,6 +233,7 @@ class MainActivity : AppCompatActivity() {
         readerMode = "старт"
         benchText = ""
         recoveries.set(0)
+        rejected.set(0)
         stalled = false
         autoDecided = false
         framedMode = false
@@ -583,6 +585,7 @@ class MainActivity : AppCompatActivity() {
 
         var shift = -1
         var pending = -1
+        var badInRow = 0
         var cur = 0
         var fpsCount = 0
         var rxPrev = 0
@@ -600,7 +603,7 @@ class MainActivity : AppCompatActivity() {
                 if (shift < 0) {
                     lockTries.incrementAndGet()
                     val s = ThermalDecoder.findShift(u16)
-                    if (s >= 0 && s == pending) {
+                    if (s >= 0 && s == pending && ThermalDecoder.frameOk(u16, s)) {
                         shift = s
                         lockOk.incrementAndGet()
                         setStatus("Фаза: столбец ${s % ThermalDecoder.ROW}, строка ${s / ThermalDecoder.ROW}")
@@ -608,12 +611,18 @@ class MainActivity : AppCompatActivity() {
                     pending = s
                     continue
                 }
-                if (ThermalDecoder.syncLost(u16, shift)) {
-                    shift = -1
-                    pending = -1
-                    relocks.incrementAndGet()
+                if (!ThermalDecoder.frameOk(u16, shift)) {
+                    // рваный/съехавший кадр не показываем; если так 3 раза подряд — ищем фазу заново
+                    rejected.incrementAndGet()
+                    if (++badInRow >= 3) {
+                        shift = -1
+                        pending = -1
+                        badInRow = 0
+                        relocks.incrementAndGet()
+                    }
                     continue
                 }
+                badInRow = 0
 
                 ThermalDecoder.decode(u16, shift, img)
                 renderer.render(img, CONTRAST_PCT, EQUALIZE, argb)
