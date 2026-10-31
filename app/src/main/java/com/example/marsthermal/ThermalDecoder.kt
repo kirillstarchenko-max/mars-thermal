@@ -1,7 +1,5 @@
 package com.example.marsthermal
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -18,10 +16,11 @@ object ThermalDecoder {
     const val FRAME_BYTES = VALUES * 2     // 1313280
 
     fun toU16(frame: ByteArray, out: ShortArray) {
-        ByteBuffer.wrap(frame, 0, FRAME_BYTES)
-            .order(ByteOrder.LITTLE_ENDIAN)
-            .asShortBuffer()
-            .get(out)
+        var j = 0
+        for (i in 0 until VALUES) {
+            out[i] = ((frame[j + 1].toInt() shl 8) or (frame[j].toInt() and 0xFF)).toShort()
+            j += 2
+        }
     }
 
     private fun u(a: ShortArray, i: Int): Int = a[i % VALUES].toInt() and 0xFFFF
