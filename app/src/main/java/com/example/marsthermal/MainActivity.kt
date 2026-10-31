@@ -75,6 +75,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var readerMode = "-"
     @Volatile private var framedMode = false       // false: кадры нарезаются по байтам; true: по границам "коротких" запросов
     @Volatile private var asmReset = false
+    @Volatile private var autoDecided = false      // авто-выбор режима уже сделан (или пользователь тапнул)
     @Volatile private var relockRequest = false
     @Volatile private var lastGap = 0L
     @Volatile private var reqSizeUsed = 0
@@ -89,7 +90,7 @@ class MainActivity : AppCompatActivity() {
                     "запросов ${completions.get()} | кадров ${rxFrames.get()} | " +
                     "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()}\n" +
                     "коротких ${shortCount.get()} (длина=кадр: ${gapOk.get()}) | послед. длина $lastGap | " +
-                    "брак ${badFrames.get()} | режим: ${if (framedMode) "ПО КОРОТКИМ" else "по байтам"} (тап по экрану)" +
+                    "брак ${badFrames.get()} | режим: ${if (framedMode) "ПО КОРОТКИМ" else "по байтам"} (авто; тап — вручную)" +
                     (if (lastErr.isNotEmpty()) "\nОШИБКА: $lastErr" else "")
             handler.postDelayed(this, 500)
         }
@@ -118,6 +119,7 @@ class MainActivity : AppCompatActivity() {
         }
         image.setOnClickListener {
             framedMode = !framedMode
+            autoDecided = true
             asmReset = true
             relockRequest = true
         }
@@ -213,6 +215,8 @@ class MainActivity : AppCompatActivity() {
         completions.set(0)
         lastErr = ""
         readerMode = "старт"
+        autoDecided = false
+        framedMode = false
         shortCount.set(0)
         gapOk.set(0)
         badFrames.set(0)
@@ -423,6 +427,17 @@ class MainActivity : AppCompatActivity() {
                 b.limit(n)
                 if (framedMode) asm.feedFramed(b, n, isShort) else if (n > 0) asm.feed(b, n)
                 b.clear()
+
+                // Авто-выбор: если почти все короткие завершения отстоят ровно на кадр — берём границы из USB.
+                if (isShort && !autoDecided && shortCount.get() >= 30) {
+                    autoDecided = true
+                    if (gapOk.get() * 10 >= shortCount.get() * 9) {
+                        framedMode = true
+                        asm.reset()
+                        sinceShort = 0
+                        relockRequest = true
+                    }
+                }
                 if (!done.queue(b)) { lastErr = "queue() не удался в цикле"; return false }
             }
             return true
