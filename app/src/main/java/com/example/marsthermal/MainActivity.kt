@@ -9,6 +9,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
@@ -30,6 +31,7 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
@@ -66,6 +68,22 @@ class MainActivity : AppCompatActivity() {
     private val ready = ArrayBlockingQueue<ByteArray>(2)
     private val rxFrames = AtomicInteger(0)
     private val relocks = AtomicInteger(0)
+    private val lockTries = AtomicInteger(0)
+    private val lockOk = AtomicInteger(0)
+    private val rxBytes = AtomicLong(0)
+    private val completions = AtomicLong(0)
+    @Volatile private var readerMode = "-"
+    @Volatile private var lastErr = ""
+    private lateinit var debugView: TextView
+    private val ticker = object : Runnable {
+        override fun run() {
+            debugView.text = "reader: $readerMode | ${rxBytes.get() / 1_000_000} МБ | " +
+                    "запросов ${completions.get()} | кадров ${rxFrames.get()} | " +
+                    "фаза ${lockOk.get()}/${lockTries.get()} | срывов ${relocks.get()}" +
+                    (if (lastErr.isNotEmpty()) "\nОШИБКА: $lastErr" else "")
+            handler.postDelayed(this, 500)
+        }
+    }
 
     private val bitmaps = arrayOf(
         Bitmap.createBitmap(ThermalDecoder.WIDTH, ThermalDecoder.OUT_H, Bitmap.Config.ARGB_8888),
@@ -101,6 +119,16 @@ class MainActivity : AppCompatActivity() {
         root.addView(status, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.START).apply { topMargin = 96 })
+        debugView = TextView(this).apply {
+            setTextColor(Color.YELLOW)
+            setBackgroundColor(0x99000000.toInt())
+            setPadding(16, 8, 16, 8)
+            textSize = 12f
+            text = "debug..."
+        }
+        root.addView(debugView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.START).apply { bottomMargin = 48 })
         setContentView(root)
 
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
@@ -112,10 +140,12 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         handler.post(poll)
+        handler.post(ticker)
     }
 
     override fun onPause() {
         handler.removeCallbacks(poll)
+        handler.removeCallbacks(ticker)
         permRequested = false
         stop()
         super.onPause()
@@ -162,6 +192,12 @@ class MainActivity : AppCompatActivity() {
         repeat(4) { free.offer(ByteArray(ThermalDecoder.FRAME_BYTES)) }
         rxFrames.set(0)
         relocks.set(0)
+        lockTries.set(0)
+        lockOk.set(0)
+        rxBytes.set(0)
+        completions.set(0)
+        lastErr = ""
+        readerMode = "старт"
         readerThread = thread(name = "usb-reader") { readerLoop(dev) }
         workerThread = thread(name = "decoder") { workerLoop() }
     }
@@ -187,106 +223,175 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Чтение через асинхронную очередь UsbRequest: всегда висит REQ_COUNT запросов,
-     * поэтому у камеры нет пауз между запросами и данные не теряются.
-     */
-    private fun readerLoop(dev: UsbDevice) {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+    /** Собирает поток байт в кадры по FRAME_BYTES. */
+    private inner class Assembler {
+        private var cur = obtain()
+        private var curLen = 0
 
-        val conn = usb.openDevice(dev)
-        if (conn == null) {
-            setStatus("openDevice вернул null (нет разрешения?)")
-            running = false
-            return
-        }
-        var iface: UsbInterface? = null
-        var ep: UsbEndpoint? = null
-        loop@ for (i in 0 until dev.interfaceCount) {
-            val itf = dev.getInterface(i)
-            for (j in 0 until itf.endpointCount) {
-                val e = itf.getEndpoint(j)
-                if (e.address == EP_IN && e.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                    iface = itf; ep = e
-                    break@loop
-                }
+        fun reset() { curLen = 0 }
+
+        private fun advance(take: Int) {
+            curLen += take
+            if (curLen == ThermalDecoder.FRAME_BYTES) {
+                publish(cur)
+                rxFrames.incrementAndGet()
+                cur = obtain()
+                curLen = 0
             }
         }
-        if (iface == null || ep == null) {
-            setStatus("Endpoint 0x81 не найден")
-            conn.close(); running = false
-            return
-        }
-        val endpoint: UsbEndpoint = ep
-        val usbInterface: UsbInterface = iface
-        if (!conn.claimInterface(usbInterface, true)) {
-            setStatus("claimInterface не удался")
-            conn.close(); running = false
-            return
-        }
 
-        val bufs = Array(REQ_COUNT) { ByteBuffer.allocateDirect(REQ_SIZE) }
-        val reqs = ArrayList<UsbRequest>()
-        var setupOk = true
-        for (i in 0 until REQ_COUNT) {
-            val r = UsbRequest()
-            if (!r.initialize(conn, endpoint)) { setupOk = false; break }
-            r.clientData = i
-            bufs[i].clear()
-            if (!r.queue(bufs[i])) { setupOk = false; break }
-            reqs.add(r)
-        }
-        if (!setupOk) setStatus("Не удалось поставить USB-запросы в очередь")
-
-        var cur = obtain()
-        var curLen = 0
-        var fails = 0
-        while (running && setupOk) {
-            val done: UsbRequest? = try {
-                conn.requestWait(200)
-            } catch (e: TimeoutException) {
-                null
-            }
-            if (done == null) {
-                if (++fails > 15) { setStatus("Нет данных от камеры"); fails = 0 }
-                continue
-            }
-            fails = 0
-            val b = bufs[done.clientData as Int]
-            var n = b.position()
-            if (n <= 0 || n > REQ_SIZE) n = REQ_SIZE
-            b.position(0)
-            b.limit(n)
-
+        fun feed(b: ByteBuffer, n: Int) {
             var off = 0
             while (off < n) {
                 val take = minOf(n - off, ThermalDecoder.FRAME_BYTES - curLen)
                 b.get(cur, curLen, take)
-                curLen += take
                 off += take
-                if (curLen == ThermalDecoder.FRAME_BYTES) {
-                    publish(cur)
-                    rxFrames.incrementAndGet()
-                    cur = obtain()
-                    curLen = 0
-                }
-            }
-            b.clear()
-            if (!done.queue(b)) {
-                setStatus("queue() не удался")
-                break
+                advance(take)
             }
         }
 
-        for (r in reqs) {
-            try { r.cancel() } catch (_: Exception) {}
-            try { r.close() } catch (_: Exception) {}
+        fun feed(b: ByteArray, start: Int, n: Int) {
+            var off = 0
+            while (off < n) {
+                val take = minOf(n - off, ThermalDecoder.FRAME_BYTES - curLen)
+                System.arraycopy(b, start + off, cur, curLen, take)
+                off += take
+                advance(take)
+            }
         }
-        conn.releaseInterface(usbInterface)
-        conn.close()
+    }
+
+    private fun readerLoop(dev: UsbDevice) {
+        try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+
+            val conn = usb.openDevice(dev)
+            if (conn == null) {
+                lastErr = "openDevice вернул null (нет разрешения?)"
+                running = false
+                return
+            }
+            var iface: UsbInterface? = null
+            var ep: UsbEndpoint? = null
+            loop@ for (i in 0 until dev.interfaceCount) {
+                val itf = dev.getInterface(i)
+                for (j in 0 until itf.endpointCount) {
+                    val e = itf.getEndpoint(j)
+                    if (e.address == EP_IN && e.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                        iface = itf; ep = e
+                        break@loop
+                    }
+                }
+            }
+            if (iface == null || ep == null) {
+                lastErr = "Endpoint 0x81 не найден"
+                conn.close(); running = false
+                return
+            }
+            val endpoint: UsbEndpoint = ep
+            val usbInterface: UsbInterface = iface
+            if (!conn.claimInterface(usbInterface, true)) {
+                lastErr = "claimInterface не удался"
+                conn.close(); running = false
+                return
+            }
+
+            val asm = Assembler()
+            readerMode = "async"
+            val asyncOk = try {
+                runAsync(conn, endpoint, asm)
+            } catch (t: Throwable) {
+                lastErr = "async: $t"
+                false
+            }
+            if (running && !asyncOk) {
+                readerMode = "sync (запасной)"
+                asm.reset()
+                runSync(conn, endpoint, asm)
+            }
+            conn.releaseInterface(usbInterface)
+            conn.close()
+        } catch (t: Throwable) {
+            lastErr = "reader: $t"
+            running = false
+        }
+    }
+
+    /** Асинхронная очередь UsbRequest: всегда висит REQ_COUNT запросов, пауз между ними нет. */
+    private fun runAsync(conn: UsbDeviceConnection, ep: UsbEndpoint, asm: Assembler): Boolean {
+        val bufs = Array(REQ_COUNT) { ByteBuffer.allocateDirect(REQ_SIZE) }
+        val reqs = ArrayList<UsbRequest>()
+        try {
+            for (i in 0 until REQ_COUNT) {
+                val r = UsbRequest()
+                if (!r.initialize(conn, ep)) { lastErr = "UsbRequest.initialize не удался"; return false }
+                r.clientData = i
+                reqs.add(r)
+                bufs[i].clear()
+                if (!r.queue(bufs[i])) { lastErr = "queue() не удался при старте"; return false }
+            }
+            val t0 = System.currentTimeMillis()
+            var gotAny = false
+            while (running) {
+                val done: UsbRequest? = try {
+                    conn.requestWait(200)
+                } catch (e: TimeoutException) {
+                    null
+                }
+                if (done == null) {
+                    if (!gotAny && System.currentTimeMillis() - t0 > 2500) {
+                        lastErr = "async: за 2.5 с ни один запрос не завершился"
+                        return false
+                    }
+                    continue
+                }
+                gotAny = true
+                completions.incrementAndGet()
+                val b = bufs[done.clientData as Int]
+                var n = b.position()
+                if (n <= 0 || n > REQ_SIZE) n = REQ_SIZE
+                rxBytes.addAndGet(n.toLong())
+                b.position(0)
+                b.limit(n)
+                asm.feed(b, n)
+                b.clear()
+                if (!done.queue(b)) { lastErr = "queue() не удался в цикле"; return false }
+            }
+            return true
+        } finally {
+            for (r in reqs) {
+                try { r.cancel() } catch (_: Exception) {}
+                try { r.close() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    /** Запасной вариант: синхронные bulkTransfer по 64 КБ (как в первой версии). */
+    private fun runSync(conn: UsbDeviceConnection, ep: UsbEndpoint, asm: Assembler) {
+        val chunk = ByteArray(65536)
+        var fails = 0
+        while (running) {
+            val n = conn.bulkTransfer(ep, chunk, chunk.size, 100)
+            if (n <= 0) {
+                if (++fails > 50) { lastErr = "sync: нет данных от камеры"; fails = 0 }
+                continue
+            }
+            fails = 0
+            completions.incrementAndGet()
+            rxBytes.addAndGet(n.toLong())
+            asm.feed(chunk, 0, n)
+        }
     }
 
     private fun workerLoop() {
+        try {
+            workerBody()
+        } catch (t: Throwable) {
+            lastErr = "worker: $t"
+        }
+    }
+
+    private fun workerBody() {
         val u16 = ShortArray(ThermalDecoder.VALUES)
         val img = ShortArray(ThermalDecoder.OUT_H * ThermalDecoder.WIDTH)
         val argb = IntArray(img.size)
@@ -308,16 +413,16 @@ class MainActivity : AppCompatActivity() {
                 ThermalDecoder.toU16(f, u16)
 
                 if (shift < 0) {
-                    // фаза принимается, когда два кадра подряд дали один и тот же сдвиг
+                    lockTries.incrementAndGet()
                     val s = ThermalDecoder.findShift(u16)
                     if (s >= 0 && s == pending) {
                         shift = s
+                        lockOk.incrementAndGet()
                         setStatus("Фаза: столбец ${s % ThermalDecoder.ROW}, строка ${s / ThermalDecoder.ROW}")
                     }
                     pending = s
                     continue
                 }
-                // проверяем каждый кадр (стоит доли миллисекунды): битый кадр не показываем
                 if (ThermalDecoder.syncLost(u16, shift)) {
                     shift = -1
                     pending = -1
