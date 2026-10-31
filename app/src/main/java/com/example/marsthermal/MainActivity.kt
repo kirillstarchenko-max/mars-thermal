@@ -14,6 +14,8 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -41,6 +43,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
 
     @Volatile private var running = false
+    private var permRequested = false
+    private val handler = Handler(Looper.getMainLooper())
+    private val poll = object : Runnable {
+        override fun run() {
+            if (!running) connectOrRequest()
+            handler.postDelayed(this, 2000)
+        }
+    }
     private var readerThread: Thread? = null
     private var workerThread: Thread? = null
     private val frames = ArrayBlockingQueue<ByteArray>(2)
@@ -88,10 +98,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        connectOrRequest()
+        handler.post(poll)
     }
 
     override fun onPause() {
+        handler.removeCallbacks(poll)
+        permRequested = false
         stop()
         super.onPause()
     }
@@ -107,12 +119,19 @@ class MainActivity : AppCompatActivity() {
     private fun connectOrRequest() {
         val dev = findDevice()
         if (dev == null) {
-            setStatus("Камера не найдена. Проверьте OTG и кабель")
+            permRequested = false
+            val all = usb.deviceList.values.joinToString(", ") {
+                "%04x:%04x".format(it.vendorId, it.productId)
+            }
+            setStatus("Камера не найдена. Видно USB-устройств: " +
+                    (if (all.isEmpty()) "ни одного" else all))
             return
         }
         if (usb.hasPermission(dev)) {
             start()
-        } else {
+        } else if (!permRequested) {
+            permRequested = true
+            setStatus("Камера найдена, жду разрешение USB...")
             val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
             val pi = PendingIntent.getBroadcast(
                 this, 0, Intent(ACTION_PERM).setPackage(packageName), flags
