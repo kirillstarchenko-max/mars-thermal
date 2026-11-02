@@ -59,8 +59,8 @@ class MainActivity : AppCompatActivity() {
         const val EP_IN = 0x81
         const val ACTION_PERM = "com.example.marsthermal.USB_PERMISSION"
         const val REQ_SIZE = 65536
-        const val REQ_COUNT = 16            // ~1 МБ запросов в очереди
-        const val STALL_MS = 4000L          // камера молчит дольше -> переподключаемся
+        const val REQ_COUNT = 16
+        const val STALL_MS = 4000L
         private val CONTRAST_NAMES = arrayOf("как у камеры", "авто", "выравнивание")
         private val RETICLE_NAMES = arrayOf("выкл", "перекрестие", "+ значение", "+ горячая/холодная")
     }
@@ -77,7 +77,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnReticle: Button
     private lateinit var btnInfo: Button
 
-    // настройки отображения (читает поток обработки)
+    // настройки отображения
     @Volatile private var palIdx = 0
     @Volatile private var invert = false
     @Volatile private var contrast = 1
@@ -98,11 +98,9 @@ class MainActivity : AppCompatActivity() {
     private var readerThread: Thread? = null
     private var workerThread: Thread? = null
 
-    // пул кадровых буферов: reader берёт из free, отдаёт в ready; worker возвращает в free
     private val free = ArrayBlockingQueue<ByteArray>(8)
     private val ready = ArrayBlockingQueue<ByteArray>(2)
 
-    // статистика для экрана «Инфо»
     private val rxFrames = AtomicInteger(0)
     private val rxBytes = AtomicLong(0)
     private val relocks = AtomicInteger(0)
@@ -119,6 +117,14 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var tUi = 0.0
     @Volatile private var dumps = 0
 
+    // статистика от NDK/Kotlin рендерера (для прицела)
+    @Volatile private var rendererMinPos = 0
+    @Volatile private var rendererMaxPos = 0
+    @Volatile private var rendererMinLevel = 0
+    @Volatile private var rendererMaxLevel = 0
+    @Volatile private var rendererCenterLevel = 0
+    private val nativeStats = IntArray(6)
+
     private val bitmaps = arrayOf(
         Bitmap.createBitmap(ThermalDecoder.WIDTH, ThermalDecoder.OUT_H, Bitmap.Config.ARGB_8888),
         Bitmap.createBitmap(ThermalDecoder.WIDTH, ThermalDecoder.OUT_H, Bitmap.Config.ARGB_8888)
@@ -129,7 +135,8 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             if (showInfo) {
                 infoView.visibility = View.VISIBLE
-                infoView.text = "reader: $readerMode | ${rxBytes.get() / 1_000_000} МБ | кадров ${rxFrames.get()} | " +
+                val mode = if (NativeRenderer.available) "NDK" else "Kotlin"
+                infoView.text = "reader: $readerMode | рендер: $mode | ${rxBytes.get() / 1_000_000} МБ | кадров ${rxFrames.get()} | " +
                         "показано ${shown.get()}\n" +
                         "срывов ${relocks.get()} | брак ${rejected.get()} | переподк. ${recoveries.get()}\n" +
                         "время: разбор %.1f | обработка %.1f | вывод %.1f мс\n".format(tDec, tRen, tUi) +
@@ -220,7 +227,6 @@ class MainActivity : AppCompatActivity() {
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         setContentView(root)
 
-        // полноэкранный режим без системных панелей
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
@@ -299,7 +305,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Отладочный дамп сырого кадра в Загрузки/MarsThermal (только при включённом «Инфо»). */
     private fun dumpFrame(name: String, f: ByteArray) {
         if (Build.VERSION.SDK_INT < 29) return
         try {
@@ -406,7 +411,6 @@ class MainActivity : AppCompatActivity() {
 
     // ------------------------------------------------------------------- USB
 
-    /** Собирает поток байт в кадры по FRAME_BYTES. */
     private inner class Assembler {
         private var cur = obtain()
         private var curLen = 0
@@ -448,7 +452,6 @@ class MainActivity : AppCompatActivity() {
         try { Thread.sleep(ms) } catch (_: InterruptedException) {}
     }
 
-    /** Внешний цикл: если камера замолчала или отвалилась, закрываем соединение и открываем заново. */
     private fun readerLoop(first: UsbDevice) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
         var dev: UsbDevice? = first
@@ -503,7 +506,6 @@ class MainActivity : AppCompatActivity() {
             conn.close()
             return
         }
-        // как clear_halt / set_interface в Python: сбрасываем состояние конечной точки перед чтением
         try { conn.setInterface(usbInterface) } catch (_: Throwable) {}
         try { conn.controlTransfer(0x02, 0x01, 0, EP_IN, null, 0, 1000) } catch (_: Throwable) {}
 
@@ -526,7 +528,6 @@ class MainActivity : AppCompatActivity() {
         conn.close()
     }
 
-    /** Асинхронная очередь UsbRequest: всегда висит ~1 МБ запросов, пауз между ними нет. */
     private fun runAsync(conn: UsbDeviceConnection, ep: UsbEndpoint, asm: Assembler): Boolean {
         val bufs = Array(REQ_COUNT) { ByteBuffer.allocateDirect(REQ_SIZE) }
         val reqs = ArrayList<UsbRequest>()
@@ -563,7 +564,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 gotAny = true
                 val b = bufs[done.clientData as Int]
-                // position() после завершения = число принятых байт (0 = пустой пакет, это НЕ полный буфер)
                 var n = b.position()
                 if (n < 0) n = 0
                 if (n > REQ_SIZE) n = REQ_SIZE
@@ -586,7 +586,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Запасной вариант: синхронные bulkTransfer (как в Python на Orange Pi). */
     private fun runSync(conn: UsbDeviceConnection, ep: UsbEndpoint, asm: Assembler) {
         val chunk = ByteArray(REQ_SIZE)
         var lastDataMs = System.currentTimeMillis()
@@ -660,6 +659,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun drawOverlayNative(c: Canvas, mode: Int, stats: IntArray) {
+        if (mode <= 0) return
+        val w = ThermalDecoder.WIDTH
+        val cx = w / 2f
+        val cy = ThermalDecoder.OUT_H / 2f
+        cross(c, cx, cy, 6f, 30f)
+        if (mode >= 2) outlined(c, "L ${stats[4]}", cx + 38f, cy - 8f)
+        if (mode >= 3) {
+            val hx = (stats[0] % w).toFloat()
+            val hy = (stats[0] / w).toFloat()
+            cross(c, hx, hy, 3f, 10f)
+            outlined(c, "H ${stats[3]}", minOf(hx + 12f, w - 80f), maxOf(hy - 6f, 22f))
+            val lx = (stats[1] % w).toFloat()
+            val ly = (stats[1] / w).toFloat()
+            cross(c, lx, ly, 3f, 10f)
+            outlined(c, "C ${stats[2]}", minOf(lx + 12f, w - 80f), minOf(ly + 20f, ThermalDecoder.OUT_H - 6f))
+        }
+    }
+
     private fun workerBody() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
         var hint: Any? = null
@@ -670,9 +688,10 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Throwable) {}
         }
 
-        val y = ByteArray(ThermalRenderer.N)
-        val argb = IntArray(ThermalRenderer.N)
-        val renderer = ThermalRenderer()
+        val nativeOk = NativeRenderer.available
+        val y = if (nativeOk) null else ByteArray(ThermalRenderer.N)
+        val argb = if (nativeOk) null else IntArray(ThermalRenderer.N)
+        val renderer = if (nativeOk) null else ThermalRenderer()
         val canvases = arrayOf(Canvas(bitmaps[0]), Canvas(bitmaps[1]))
 
         var shift = -1
@@ -687,17 +706,19 @@ class MainActivity : AppCompatActivity() {
                 shift = -1
                 badInRow = 0
                 relockRequest = false
+                if (nativeOk) NativeRenderer.resetNative()
+                renderer?.reset()
             }
             val f = ready.poll(200, TimeUnit.MILLISECONDS) ?: continue
             try {
                 val t0 = System.nanoTime()
                 if (shift < 0) {
-                    // одного кадра достаточно: он должен пройти строгую проверку
                     val s = ThermalDecoder.findShift(f)
                     if (s >= 0 && ThermalDecoder.frameOk(f, s)) {
                         shift = s
                         badInRow = 0
-                        renderer.reset()
+                        renderer?.reset()
+                        if (nativeOk) NativeRenderer.resetNative()
                         if (showInfo && dumps == 0) { dumps = 1; dumpFrame("good_shift$s.bin", f) }
                     } else {
                         continue
@@ -719,15 +740,29 @@ class MainActivity : AppCompatActivity() {
                     badInRow = 0
                 }
 
-                ThermalDecoder.decodeY(f, shift, y)
-                val t1 = System.nanoTime()
-                renderer.render(y, tnr, contrast, palette, argb)
-                val t2 = System.nanoTime()
                 val bmp = bitmaps[cur]
                 val cv = canvases[cur]
                 cur = 1 - cur
-                bmp.setPixels(argb, 0, ThermalDecoder.WIDTH, 0, 0, ThermalDecoder.WIDTH, ThermalDecoder.OUT_H)
-                drawOverlay(cv, reticle, renderer)
+                val t1: Long
+                val t2: Long
+                if (nativeOk) {
+                    NativeRenderer.renderNative(f, shift, tnr, contrast, palette, bmp, nativeStats)
+                    rendererMinPos = nativeStats[0]
+                    rendererMaxPos = nativeStats[1]
+                    rendererMinLevel = nativeStats[2]
+                    rendererMaxLevel = nativeStats[3]
+                    rendererCenterLevel = nativeStats[4]
+                    t1 = System.nanoTime()
+                    t2 = System.nanoTime()
+                    drawOverlayNative(cv, reticle, nativeStats)
+                } else {
+                    ThermalDecoder.decodeY(f, shift, y!!)
+                    t1 = System.nanoTime()
+                    renderer!!.render(y, tnr, contrast, palette, argb!!)
+                    t2 = System.nanoTime()
+                    bmp.setPixels(argb, 0, ThermalDecoder.WIDTH, 0, 0, ThermalDecoder.WIDTH, ThermalDecoder.OUT_H)
+                    drawOverlay(cv, reticle, renderer)
+                }
                 lastBmp = bmp
                 val t3 = System.nanoTime()
 
