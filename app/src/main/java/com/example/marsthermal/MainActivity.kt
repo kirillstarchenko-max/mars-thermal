@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -28,6 +30,7 @@ import android.os.Process
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -65,10 +68,13 @@ class MainActivity : AppCompatActivity() {
         private val RETICLE_NAMES = arrayOf("выкл", "перекрестие", "+ значение", "+ горячая/холодная")
         private val SHARP_NAMES = arrayOf("выкл", "слабая", "средняя", "сильная")
         private val VIEW_NAMES = arrayOf("вписать", "на весь экран", "растянуть")
+        private val ROTATE_NAMES = arrayOf("авто", "горизонт.", "вертик.")
+        private val ROTATE_MODES = intArrayOf(
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR,
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT)
         private val VIEW_SCALE = arrayOf(
             ImageView.ScaleType.FIT_CENTER, ImageView.ScaleType.CENTER_CROP, ImageView.ScaleType.FIT_XY)
-        const val CALIB_FRAMES = 32         // ~1 с усреднения
-        const val CALIB_FILE = "calib2.bin"     // узор матрицы без плавных перепадов (calib.bin был старый формат)
     }
 
     private lateinit var usb: UsbManager
@@ -83,7 +89,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnReticle: Button
     private lateinit var btnSharp: Button
     private lateinit var btnView: Button
-    private lateinit var btnCalib: Button
+    private lateinit var btnStripes: Button
+    private lateinit var btnRotate: Button
+    private lateinit var buttons: List<Button>
     private lateinit var btnInfo: Button
 
     // настройки отображения
@@ -94,7 +102,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var reticle = 1
     @Volatile private var showInfo = false
     @Volatile private var sharp = 1
+    @Volatile private var destripe = true
     private var viewMode = 0
+    private var rotateMode = 0
     @Volatile private var palette: IntArray = Palettes.get(0, false)
 
     @Volatile private var running = false
@@ -128,10 +138,6 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var tUi = 0.0
     @Volatile private var dumps = 0
 
-    // калибровка: UI ставит запрос, поток обработки выполняет (нативное состояние трогает только он)
-    @Volatile private var calibRequest = 0     // 1 начать, 2 сбросить
-    @Volatile private var calibLeft = 0
-    @Volatile private var haveCalib = false
 
     // статистика от NDK/Kotlin рендерера (для прицела)
     @Volatile private var rendererMinPos = 0
@@ -139,8 +145,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var rendererMinLevel = 0
     @Volatile private var rendererMaxLevel = 0
     @Volatile private var rendererCenterLevel = 0
-    private val nativeStats = IntArray(8)
-    @Volatile private var calibAlpha = -1
+    private val nativeStats = IntArray(6)
 
     private val bitmaps = arrayOf(
         Bitmap.createBitmap(ThermalDecoder.WIDTH, ThermalDecoder.OUT_H, Bitmap.Config.ARGB_8888),
@@ -157,13 +162,11 @@ class MainActivity : AppCompatActivity() {
                         "показано ${shown.get()}\n" +
                         "срывов ${relocks.get()} | брак ${rejected.get()} | переподк. ${recoveries.get()}\n" +
                         "время: разбор %.1f | обработка %.1f | вывод %.1f мс\n".format(tDec, tRen, tUi) +
-                        (if (calibAlpha >= 0) "калибровка: сила поправки %.2f\n".format(calibAlpha / 100.0) else "") +
                         (if (lastReject.isNotEmpty()) "последний брак: $lastReject\n" else "") +
                         (if (lastErr.isNotEmpty()) "ОШИБКА: $lastErr" else "")
             } else {
                 infoView.visibility = View.GONE
             }
-            refreshCalibButton()
             handler.postDelayed(this, 500)
         }
     }
@@ -197,8 +200,12 @@ class MainActivity : AppCompatActivity() {
         showInfo = prefs.getBoolean("info", false)
         sharp = prefs.getInt("sharp", 1)
         viewMode = prefs.getInt("view", 0)
+        destripe = prefs.getBoolean("destripe", true)
+        rotateMode = prefs.getInt("rotate", 0).coerceIn(0, ROTATE_MODES.size - 1)
+        requestedOrientation = ROTATE_MODES[rotateMode]
+        // калибровки больше нет: убираем её старые файлы
         java.io.File(filesDir, "calib.bin").delete()
-        haveCalib = calibFile().exists()
+        java.io.File(filesDir, "calib2.bin").delete()
         palette = Palettes.get(palIdx, invert)
 
         image = ImageView(this).apply {
@@ -220,7 +227,7 @@ class MainActivity : AppCompatActivity() {
             visibility = View.GONE
         }
         bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(0x66000000)
         }
         btnPal = makeButton({ cyclePalette(1) }, { invert = !invert; applySettings() })
@@ -229,13 +236,14 @@ class MainActivity : AppCompatActivity() {
         btnSharp = makeButton({ sharp = (sharp + 1) % SHARP_NAMES.size; applySettings() })
         btnReticle = makeButton({ reticle = (reticle + 1) % RETICLE_NAMES.size; applySettings() })
         btnView = makeButton({ viewMode = (viewMode + 1) % VIEW_NAMES.size; applySettings() })
-        btnCalib = makeButton({ startCalibration() }, { clearCalibration() })
+        btnStripes = makeButton({ destripe = !destripe; applySettings() })
         val btnSnap = makeButton({ takeSnapshot() })
         btnSnap.text = "Снимок"
         btnInfo = makeButton({ showInfo = !showInfo; dumps = 0; applySettings() })
-        for (b in listOf(btnPal, btnContrast, btnNoise, btnSharp, btnReticle, btnView, btnCalib, btnSnap, btnInfo)) {
-            bar.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        }
+        btnRotate = makeButton({ rotateMode = (rotateMode + 1) % ROTATE_MODES.size; applySettings() })
+        buttons = listOf(btnPal, btnContrast, btnNoise, btnSharp, btnReticle,
+            btnView, btnStripes, btnRotate, btnSnap, btnInfo)
+        layoutBar()
         image.setOnClickListener {
             bar.visibility = if (bar.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -267,6 +275,27 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    /** Кнопки в одну строку в альбомной ориентации и в две — в книжной, чтобы не сжимались. */
+    private fun layoutBar() {
+        val portrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+        bar.removeAllViews()
+        for (row in buttons.chunked(if (portrait) 5 else buttons.size)) {
+            val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (b in row) {
+                (b.parent as? ViewGroup)?.removeView(b)
+                line.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            bar.addView(line, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+    }
+
+    // активность не пересоздаётся при повороте (configChanges в манифесте), USB-поток не прерывается
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        layoutBar()
+    }
+
     private fun makeButton(onClick: () -> Unit, onLong: (() -> Unit)? = null): Button =
         Button(this).apply {
             isAllCaps = false
@@ -288,8 +317,10 @@ class MainActivity : AppCompatActivity() {
         prefs.edit()
             .putInt("pal", palIdx).putBoolean("invert", invert).putInt("contrast", contrast)
             .putInt("tnr", tnr).putInt("reticle", reticle).putBoolean("info", showInfo)
-            .putInt("sharp", sharp).putInt("view", viewMode)
+            .putInt("sharp", sharp).putInt("view", viewMode).putBoolean("destripe", destripe)
+            .putInt("rotate", rotateMode)
             .apply()
+        requestedOrientation = ROTATE_MODES[rotateMode]
         refreshButtons()
     }
 
@@ -301,64 +332,9 @@ class MainActivity : AppCompatActivity() {
         btnReticle.text = "Прицел: ${RETICLE_NAMES[reticle]}"
         btnView.text = "Вид: ${VIEW_NAMES[viewMode]}"
         btnInfo.text = if (showInfo) "Инфо: вкл" else "Инфо: выкл"
-        refreshCalibButton()
+        btnStripes.text = if (destripe) "Полосы: убирать" else "Полосы: оставить"
+        btnRotate.text = "Поворот: ${ROTATE_NAMES[rotateMode]}"
         image.scaleType = VIEW_SCALE[viewMode]
-    }
-
-    private fun refreshCalibButton() {
-        btnCalib.text = when {
-            calibLeft > 0 -> "Калибровка..."
-            haveCalib -> "Калибровка: есть"
-            else -> "Калибровка: нет"
-        }
-    }
-
-    private fun calibFile() = java.io.File(filesDir, CALIB_FILE)
-
-    private fun startCalibration() {
-        if (!NativeRenderer.available) { toast("Калибровка работает только с NDK-рендером"); return }
-        calibRequest = 1
-        calibLeft = CALIB_FRAMES
-        refreshCalibButton()
-        toast("Наведите камеру на ровную стену без предметов (или закройте объектив), держите ~1 с")
-    }
-
-    private fun clearCalibration() {
-        calibRequest = 2
-        haveCalib = false
-        calibFile().delete()
-        refreshCalibButton()
-        toast("Калибровка сброшена")
-    }
-
-    /** Поток обработки: сохранить поправку после калибровки. */
-    private fun saveCalibration() {
-        val data = ShortArray(ThermalRenderer.N)
-        if (!NativeRenderer.calibGet(data)) return
-        try {
-            val bb = ByteBuffer.allocate(data.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            bb.asShortBuffer().put(data)
-            calibFile().writeBytes(bb.array())
-            haveCalib = true
-            toast("Калибровка сохранена")
-        } catch (t: Throwable) {
-            toast("Не удалось сохранить калибровку: $t")
-        }
-        runOnUiThread { refreshCalibButton() }
-    }
-
-    /** Поток обработки: загрузить сохранённую поправку в NDK-рендер. */
-    private fun loadCalibration() {
-        val f = calibFile()
-        if (!f.exists()) return
-        try {
-            val bytes = f.readBytes()
-            if (bytes.size != ThermalRenderer.N * 2) { f.delete(); haveCalib = false; return }
-            val data = ShortArray(ThermalRenderer.N)
-            ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(data)
-            NativeRenderer.calibSet(data)
-            haveCalib = true
-        } catch (_: Throwable) {}
     }
 
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
@@ -780,7 +756,6 @@ class MainActivity : AppCompatActivity() {
         val argb = if (nativeOk) null else IntArray(ThermalRenderer.N)
         val renderer = if (nativeOk) null else ThermalRenderer()
         val canvases = arrayOf(Canvas(bitmaps[0]), Canvas(bitmaps[1]))
-        if (nativeOk) loadCalibration()
 
         var shift = -1
         var badInRow = 0
@@ -796,11 +771,6 @@ class MainActivity : AppCompatActivity() {
                 relockRequest = false
                 if (nativeOk) NativeRenderer.resetNative()
                 renderer?.reset()
-            }
-            val req = calibRequest
-            if (nativeOk && req != 0) {
-                calibRequest = 0
-                if (req == 1) NativeRenderer.calibStart(CALIB_FRAMES) else NativeRenderer.calibClear()
             }
             val f = ready.poll(200, TimeUnit.MILLISECONDS) ?: continue
             try {
@@ -839,16 +809,7 @@ class MainActivity : AppCompatActivity() {
                 val t1: Long
                 val t2: Long
                 if (nativeOk) {
-                    val wasCalib = calibLeft > 0
-                    NativeRenderer.renderNative(f, shift, tnr, contrast, sharp, palette, bmp, nativeStats)
-                    if (calibRequest == 0) {
-                        calibLeft = nativeStats[5]
-                        if (wasCalib && calibLeft == 0) {
-                            if (nativeStats[7] < 0) toast("В кадре были предметы — калибровка не принята, наведите на ровную стену")
-                            else saveCalibration()
-                        }
-                    }
-                    calibAlpha = nativeStats[6]
+                    NativeRenderer.renderNative(f, shift, tnr, contrast, sharp, destripe, palette, bmp, nativeStats)
                     rendererMinPos = nativeStats[0]
                     rendererMaxPos = nativeStats[1]
                     rendererMinLevel = nativeStats[2]

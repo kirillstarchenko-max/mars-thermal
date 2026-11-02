@@ -18,7 +18,7 @@ static const int N = OUT_H * WIDTH;            // 327680
 static int acc[N];          // состояние временного фильтра, Y*16
 static int tmp[N];          // суммы по строкам для размытия 3x3
 static int blur[N];         // acc, размытый 3x3: поиск горячей/холодной точки
-static int disp[N];         // рабочий буфер (калибровка, резкость)
+static int disp[N];         // рабочий буфер: декодированный кадр, потом резкость
 static int sb1[N];          // итоговая картинка 0..255 до резкости
 static int sb2[N];
 static uint8_t idx[N];
@@ -33,24 +33,69 @@ static float hiF = 255.0f;
 static float prevAvgY = -1.0f;
 
 /*
- * Калибровка по ровной поверхности: запоминаем мелкий узор матрицы (полосы, сетку), без плавных перепадов.
- * Камера сама растягивает контраст (АРУ): на ровной стене узор усилен в разы, в обычной сцене слабее.
- * Поэтому силу поправки alpha подбираем каждый кадр: проекция кадра на узор, ровная сцена с узором
- * не коррелирует. Если калибровали не на ровном, узор с картинкой не совпадёт и alpha уйдёт к нулю.
+ * Подавление полос по столбцам и строкам прямо по сцене (как в Python-версии): в каждом столбце медиана
+ * отклонения пикселей от соседей по строке. Предметы дают отклонение лишь в части строк, а полоса
+ * матрицы во всех, поэтому медиана видит только полосу. Оценка обновляется каждый кадр, так что
+ * сама подстраивается под АРУ камеры; калибровка по ровной стене с такой камерой не работает:
+ * на ровном она растягивает пару уровней на весь диапазон, и в кадре одни контуры.
  */
-static int16_t offs[N];
-static int calSum[N];
-static bool haveOffs = false;
-static int calLeft = 0;
-static int calTotal = 0;
-static int calResult = 0;          // 1 удалась, -1 сцена неровная, 0 не было
-static long long offNorm = 0;      // сумма offs^2
-static float alphaF = 1.0f;
+static const int STRIPE_WIN = 7;            // полуокно сглаживания (15 пикселей)
+static const int STRIPE_MAX = 5 * 16;       // полоса не сильнее 5 уровней: остальное считаем сценой
+static const int COL_SAMPLES = OUT_H / 2;   // каждая вторая строка
+static const int ROW_SAMPLES = WIDTH / 2;   // каждый второй столбец
+static int colBuf[WIDTH * COL_SAMPLES];
+static int rowBuf[OUT_H * ROW_SAMPLES];
+static float colOff[WIDTH];
+static float rowOff[OUT_H];
+static bool haveStripe = false;
 
 static const int BASE_ALPHA[5] = {256, 150, 100, 64, 30};
 static const int CORE = 2;             // перепады до 2 уровней (шум) резкость не усиливает
 static const int BORDER = 4;           // края кадра у камеры с мусором: экстремумы там не ищем
 static const int SPOT_R = 32;          // окно уточнения горячей/холодной точки, пикселей
+
+static int medianOf(int* a, int n) {
+    std::nth_element(a, a + n / 2, a + n);
+    return a[n / 2];
+}
+
+/** Оценка полос по кадру disp (Y*16) и плавное обновление colOff/rowOff. */
+static void estimateStripes() {
+    // по столбцам: отклонение от среднего по 15 пикселям строки
+    for (int r = 0, n = 0; r < OUT_H; r += 2, ++n) {
+        const int* v = disp + r * WIDTH;
+        int sum = 0, cnt = 0;
+        for (int j = 0; j <= STRIPE_WIN; ++j) { sum += v[j]; ++cnt; }
+        for (int j = 0; j < WIDTH; ++j) {
+            colBuf[j * COL_SAMPLES + n] = v[j] - sum / cnt;
+            const int add = j + STRIPE_WIN + 1, del = j - STRIPE_WIN;
+            if (add < WIDTH) { sum += v[add]; ++cnt; }
+            if (del >= 0) { sum -= v[del]; --cnt; }
+        }
+    }
+    // по строкам: отклонение от среднего по 15 пикселям столбца (префиксные суммы по столбцу в tmp)
+    for (int j = 0; j < WIDTH; ++j) {
+        int run = 0;
+        for (int r = 0; r < OUT_H; ++r) { run += disp[r * WIDTH + j]; tmp[r * WIDTH + j] = run; }
+    }
+    for (int r = 0; r < OUT_H; ++r) {
+        const int r0 = std::max(0, r - STRIPE_WIN), r1 = std::min(OUT_H - 1, r + STRIPE_WIN);
+        for (int j = 0, n = 0; j < WIDTH; j += 2, ++n) {
+            const int hi = tmp[r1 * WIDTH + j], lo = r0 > 0 ? tmp[(r0 - 1) * WIDTH + j] : 0;
+            rowBuf[r * ROW_SAMPLES + n] = disp[r * WIDTH + j] - (hi - lo) / (r1 - r0 + 1);
+        }
+    }
+    const float k = haveStripe ? 0.03f : 1.0f;
+    for (int j = 0; j < WIDTH; ++j) {
+        float est = (float)std::clamp(medianOf(colBuf + j * COL_SAMPLES, COL_SAMPLES), -STRIPE_MAX, STRIPE_MAX);
+        colOff[j] += k * (est - colOff[j]);
+    }
+    for (int r = 0; r < OUT_H; ++r) {
+        float est = (float)std::clamp(medianOf(rowBuf + r * ROW_SAMPLES, ROW_SAMPLES), -STRIPE_MAX, STRIPE_MAX);
+        rowOff[r] += k * (est - rowOff[r]);
+    }
+    haveStripe = true;
+}
 
 /** Размытие 3x3 (среднее), на краях повторяется крайний пиксель. */
 static void boxBlur(const int* src, int* dst) {
@@ -118,7 +163,7 @@ JNIEXPORT void JNICALL
 Java_com_example_marsthermal_NativeRenderer_renderNative(
         JNIEnv* env, jobject /*thiz*/,
         jbyteArray frame_, jint shift,
-        jint tnr, jint contrast, jint sharp,
+        jint tnr, jint contrast, jint sharp, jboolean destripe,
         jintArray pal_,
         jobject bitmap,
         jintArray stats_) {
@@ -142,23 +187,29 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
 
     const int base = BASE_ALPHA[std::clamp((int)tnr, 0, 4)];
     const bool first = !haveAcc;
-    const bool calib = calLeft > 0;
-    const bool useOffs = haveOffs;
-    const int al = (int)(alphaF * 256.0f + 0.5f);
-    long long dotVO = 0;
 
-    // 1) Декодирование Y + поправка калибровки + временной фильтр (один проход)
+    // 1) Декодирование Y
     for (int r = 0; r < OUT_H; ++r) {
         int p = (shift + r * ROW + WIDTH) % VALUES;
+        int* d = disp + r * WIDTH;
+        for (int j = 0; j < WIDTH; ++j) {
+            d[j] = (frame[(p << 1) + 1] & 0xFF) << 4;
+            p++;
+            if (p == VALUES) p = 0;
+        }
+    }
+    if (destripe) estimateStripes();
+    else haveStripe = false;
+
+    // 2) Вычитание полос + временной фильтр
+    for (int r = 0; r < OUT_H; ++r) {
+        const int ro = destripe ? (int)rowOff[r] : 0;
         const int dst = r * WIDTH;
         for (int j = 0; j < WIDTH; ++j) {
             int i = dst + j;
-            int v = (frame[(p << 1) + 1] & 0xFF) << 4;
-            if (calib) calSum[i] += v;
-            if (useOffs) {
-                int o = offs[i];
-                dotVO += (long long)v * o;
-                v -= (o * al) >> 8;
+            int v = disp[i];
+            if (destripe) {
+                v -= (int)colOff[j] + ro;
                 if (v < 0) v = 0; else if (v > 4080) v = 4080;
             }
 
@@ -172,48 +223,11 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
                 a += (d * w) >> 8;
             }
             acc[i] = a;
-
-            p++;
-            if (p == VALUES) p = 0;
         }
     }
     haveAcc = true;
-    if (useOffs && offNorm > 0) {
-        float est = (float)((double)dotVO / (double)offNorm);
-        est = std::clamp(est, 0.0f, 3.0f);
-        alphaF += 0.1f * (est - alphaF);
-    }
 
-    // калибровка набрала кадры: узор = среднее минус его размытие (~5x5)
-    if (calib && --calLeft == 0) {
-        for (int i = 0; i < N; ++i) disp[i] = calSum[i] / calTotal;
-        boxBlur(disp, blur);
-        boxBlur(blur, sb2);
-        long long sum = 0;
-        for (int i = 0; i < N; ++i) { disp[i] -= sb2[i]; sum += disp[i]; }
-        const int mean = (int)(sum / N);
-        long long sAbs = 0;
-        for (int i = 0; i < N; ++i) { disp[i] -= mean; sAbs += std::abs(disp[i]); }
-        const int m = std::max(1, (int)(sAbs / N));
-        int outliers = 0;
-        for (int i = 0; i < N; ++i) if (std::abs(disp[i]) > 6 * m) ++outliers;
-        if (outliers > N / 1000) {
-            calResult = -1;            // в кадре были контуры предметов: старую калибровку не трогаем
-        } else {
-            offNorm = 0;
-            for (int i = 0; i < N; ++i) {
-                int o = std::clamp(disp[i], -6 * m, 6 * m);
-                offs[i] = (int16_t)o;
-                offNorm += (long long)o * o;
-            }
-            alphaF = 1.0f;
-            haveOffs = true;
-            haveAcc = false;
-            calResult = 1;
-        }
-    }
-
-    // 2) Размытие 3x3, гистограмма, экстремумы
+    // 3) Размытие 3x3, гистограмма, экстремумы
     boxBlur(acc, blur);
     std::memset(hist, 0, sizeof(hist));
     long long sumY = 0;
@@ -245,7 +259,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     }
     prevAvgY = avgY;
 
-    // 3) Границы диапазона (быстрое сглаживание)
+    // 4) Границы диапазона (быстрое сглаживание)
     float newLo = 0.0f, newHi = 255.0f;
     if (contrast != 0) {
         const float loT = N * 0.01f;
@@ -273,7 +287,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     const int lo16 = (int)(loF * 16.0f);
     const int scale = (int)((255 << 16) / (span * 16.0f));
 
-    // 4) Растяжение до 0..255
+    // 5) Растяжение до 0..255
     std::memset(hist2, 0, sizeof(hist2));
     for (int i = 0; i < N; ++i) {
         int v = ((acc[i] - lo16) * scale) >> 16;
@@ -282,7 +296,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         hist2[v]++;
     }
 
-    // 5) Выравнивание (plateau) или прямое отображение
+    // 6) Выравнивание (plateau) или прямое отображение
     if (contrast == 2) {
         const int cap = std::max(1, 2 * N / 256);
         long long total = 0;
@@ -304,7 +318,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     }
     for (int i = 0; i < N; ++i) idx[i] = (uint8_t)map256[idx[i]];
 
-    // 6) Резкость по итоговой картинке: после растяжения контраста, иначе выравнивание раздувает
+    // 7) Резкость по итоговой картинке: после растяжения контраста, иначе выравнивание раздувает
     //    её в квадраты и ореолы. Выход за min/max соседей 3x3 ограничен 4/8/12 уровнями: ореол едва заметен.
     const int k = std::clamp((int)sharp, 0, 3);
     if (k > 0) {
@@ -333,7 +347,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         }
     }
 
-    // 7) Палитра -> Bitmap (RGBA_8888: в памяти ABGR little-endian)
+    // 8) Палитра -> Bitmap (RGBA_8888: в памяти ABGR little-endian)
     uint32_t* out = (uint32_t*)pixels;
     for (int i = 0; i < N; ++i) {
         uint32_t c = (uint32_t)pal[idx[i]];
@@ -344,19 +358,17 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         out[i] = (a << 24) | (b << 16) | (g << 8) | r;
     }
 
-    // 8) Метрики для прицела
-    if (stats_ != nullptr && env->GetArrayLength(stats_) >= 8) {
-        jint stats[8];
+    // 9) Метрики для прицела
+    if (stats_ != nullptr && env->GetArrayLength(stats_) >= 6) {
+        jint stats[6];
         stats[0] = spotFind(mnI, mnV, false);
         stats[1] = spotFind(mxI, mxV, true);
         stats[2] = (mnV + 8) >> 4;
         stats[3] = (mxV + 8) >> 4;
         int ci = (OUT_H / 2) * WIDTH + WIDTH / 2;
         stats[4] = (blur[ci] + 8) >> 4;
-        stats[5] = calLeft;
-        stats[6] = haveOffs ? (int)(alphaF * 100.0f + 0.5f) : -1;
-        stats[7] = calResult;
-        env->SetIntArrayRegion(stats_, 0, 8, stats);
+        stats[5] = 0;
+        env->SetIntArrayRegion(stats_, 0, 6, stats);
     }
 
     AndroidBitmap_unlockPixels(env, bitmap);
@@ -369,41 +381,9 @@ Java_com_example_marsthermal_NativeRenderer_resetNative(JNIEnv*, jobject) {
     haveAcc = false;
     haveRange = false;
     prevAvgY = -1.0f;
+    haveStripe = false;
     for (int i = 0; i < 256; ++i) eqLut[i] = (float)i;
 }
 
-JNIEXPORT void JNICALL
-Java_com_example_marsthermal_NativeRenderer_calibStart(JNIEnv*, jobject, jint frames) {
-    std::memset(calSum, 0, sizeof(calSum));
-    calTotal = std::max(1, (int)frames);
-    calLeft = calTotal;
-    calResult = 0;
-}
-
-JNIEXPORT void JNICALL
-Java_com_example_marsthermal_NativeRenderer_calibClear(JNIEnv*, jobject) {
-    calLeft = 0;
-    haveOffs = false;
-    haveAcc = false;
-}
-
-/** Копирует поправку в out (N значений); false, если калибровки нет. */
-JNIEXPORT jboolean JNICALL
-Java_com_example_marsthermal_NativeRenderer_calibGet(JNIEnv* env, jobject, jshortArray out) {
-    if (!haveOffs || env->GetArrayLength(out) != N) return JNI_FALSE;
-    env->SetShortArrayRegion(out, 0, N, offs);
-    return JNI_TRUE;
-}
-
-JNIEXPORT void JNICALL
-Java_com_example_marsthermal_NativeRenderer_calibSet(JNIEnv* env, jobject, jshortArray in) {
-    if (env->GetArrayLength(in) != N) return;
-    env->GetShortArrayRegion(in, 0, N, offs);
-    offNorm = 0;
-    for (int i = 0; i < N; ++i) offNorm += (long long)offs[i] * offs[i];
-    alphaF = 1.0f;
-    haveOffs = true;
-    haveAcc = false;
-}
 
 } // extern "C"
