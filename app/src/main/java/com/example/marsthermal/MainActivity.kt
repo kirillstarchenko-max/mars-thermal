@@ -63,6 +63,12 @@ class MainActivity : AppCompatActivity() {
         const val STALL_MS = 4000L
         private val CONTRAST_NAMES = arrayOf("как у камеры", "авто", "выравнивание")
         private val RETICLE_NAMES = arrayOf("выкл", "перекрестие", "+ значение", "+ горячая/холодная")
+        private val SHARP_NAMES = arrayOf("выкл", "слабая", "средняя", "сильная")
+        private val VIEW_NAMES = arrayOf("вписать", "на весь экран", "растянуть")
+        private val VIEW_SCALE = arrayOf(
+            ImageView.ScaleType.FIT_CENTER, ImageView.ScaleType.CENTER_CROP, ImageView.ScaleType.FIT_XY)
+        const val CALIB_FRAMES = 32         // ~1 с усреднения
+        const val CALIB_FILE = "calib.bin"
     }
 
     private lateinit var usb: UsbManager
@@ -75,6 +81,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnContrast: Button
     private lateinit var btnNoise: Button
     private lateinit var btnReticle: Button
+    private lateinit var btnSharp: Button
+    private lateinit var btnView: Button
+    private lateinit var btnCalib: Button
     private lateinit var btnInfo: Button
 
     // настройки отображения
@@ -84,6 +93,8 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var tnr = 2
     @Volatile private var reticle = 1
     @Volatile private var showInfo = false
+    @Volatile private var sharp = 1
+    private var viewMode = 0
     @Volatile private var palette: IntArray = Palettes.get(0, false)
 
     @Volatile private var running = false
@@ -117,6 +128,11 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var tUi = 0.0
     @Volatile private var dumps = 0
 
+    // калибровка: UI ставит запрос, поток обработки выполняет (нативное состояние трогает только он)
+    @Volatile private var calibRequest = 0     // 1 начать, 2 сбросить
+    @Volatile private var calibLeft = 0
+    @Volatile private var haveCalib = false
+
     // статистика от NDK/Kotlin рендерера (для прицела)
     @Volatile private var rendererMinPos = 0
     @Volatile private var rendererMaxPos = 0
@@ -145,6 +161,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 infoView.visibility = View.GONE
             }
+            refreshCalibButton()
             handler.postDelayed(this, 500)
         }
     }
@@ -176,6 +193,9 @@ class MainActivity : AppCompatActivity() {
         tnr = prefs.getInt("tnr", 2)
         reticle = prefs.getInt("reticle", 1)
         showInfo = prefs.getBoolean("info", false)
+        sharp = prefs.getInt("sharp", 1)
+        viewMode = prefs.getInt("view", 0)
+        haveCalib = calibFile().exists()
         palette = Palettes.get(palIdx, invert)
 
         image = ImageView(this).apply {
@@ -203,11 +223,14 @@ class MainActivity : AppCompatActivity() {
         btnPal = makeButton({ cyclePalette(1) }, { invert = !invert; applySettings() })
         btnContrast = makeButton({ contrast = (contrast + 1) % CONTRAST_NAMES.size; applySettings() })
         btnNoise = makeButton({ tnr = (tnr + 1) % 5; applySettings() })
+        btnSharp = makeButton({ sharp = (sharp + 1) % SHARP_NAMES.size; applySettings() })
         btnReticle = makeButton({ reticle = (reticle + 1) % RETICLE_NAMES.size; applySettings() })
+        btnView = makeButton({ viewMode = (viewMode + 1) % VIEW_NAMES.size; applySettings() })
+        btnCalib = makeButton({ startCalibration() }, { clearCalibration() })
         val btnSnap = makeButton({ takeSnapshot() })
         btnSnap.text = "Снимок"
         btnInfo = makeButton({ showInfo = !showInfo; dumps = 0; applySettings() })
-        for (b in listOf(btnPal, btnContrast, btnNoise, btnReticle, btnSnap, btnInfo)) {
+        for (b in listOf(btnPal, btnContrast, btnNoise, btnSharp, btnReticle, btnView, btnCalib, btnSnap, btnInfo)) {
             bar.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
         image.setOnClickListener {
@@ -222,7 +245,7 @@ class MainActivity : AppCompatActivity() {
             Gravity.TOP or Gravity.START))
         root.addView(infoView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
-            Gravity.BOTTOM or Gravity.START).apply { bottomMargin = 140 })
+            Gravity.TOP or Gravity.START).apply { topMargin = 70 })
         root.addView(bar, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         setContentView(root)
@@ -262,6 +285,7 @@ class MainActivity : AppCompatActivity() {
         prefs.edit()
             .putInt("pal", palIdx).putBoolean("invert", invert).putInt("contrast", contrast)
             .putInt("tnr", tnr).putInt("reticle", reticle).putBoolean("info", showInfo)
+            .putInt("sharp", sharp).putInt("view", viewMode)
             .apply()
         refreshButtons()
     }
@@ -270,8 +294,68 @@ class MainActivity : AppCompatActivity() {
         btnPal.text = "Палитра: ${Palettes.NAMES[palIdx]}${if (invert) " (инв.)" else ""}"
         btnContrast.text = "Контраст: ${CONTRAST_NAMES[contrast]}"
         btnNoise.text = "Шумоподавл.: ${if (tnr == 0) "выкл" else tnr.toString()}"
+        btnSharp.text = "Резкость: ${SHARP_NAMES[sharp]}"
         btnReticle.text = "Прицел: ${RETICLE_NAMES[reticle]}"
+        btnView.text = "Вид: ${VIEW_NAMES[viewMode]}"
         btnInfo.text = if (showInfo) "Инфо: вкл" else "Инфо: выкл"
+        refreshCalibButton()
+        image.scaleType = VIEW_SCALE[viewMode]
+    }
+
+    private fun refreshCalibButton() {
+        btnCalib.text = when {
+            calibLeft > 0 -> "Калибровка..."
+            haveCalib -> "Калибровка: есть"
+            else -> "Калибровка: нет"
+        }
+    }
+
+    private fun calibFile() = java.io.File(filesDir, CALIB_FILE)
+
+    private fun startCalibration() {
+        if (!NativeRenderer.available) { toast("Калибровка работает только с NDK-рендером"); return }
+        calibRequest = 1
+        calibLeft = CALIB_FRAMES
+        refreshCalibButton()
+        toast("Наведите камеру на ровную стену или закройте объектив, держите ~1 с")
+    }
+
+    private fun clearCalibration() {
+        calibRequest = 2
+        haveCalib = false
+        calibFile().delete()
+        refreshCalibButton()
+        toast("Калибровка сброшена")
+    }
+
+    /** Поток обработки: сохранить поправку после калибровки. */
+    private fun saveCalibration() {
+        val data = ShortArray(ThermalRenderer.N)
+        if (!NativeRenderer.calibGet(data)) return
+        try {
+            val bb = ByteBuffer.allocate(data.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            bb.asShortBuffer().put(data)
+            calibFile().writeBytes(bb.array())
+            haveCalib = true
+            toast("Калибровка сохранена")
+        } catch (t: Throwable) {
+            toast("Не удалось сохранить калибровку: $t")
+        }
+        runOnUiThread { refreshCalibButton() }
+    }
+
+    /** Поток обработки: загрузить сохранённую поправку в NDK-рендер. */
+    private fun loadCalibration() {
+        val f = calibFile()
+        if (!f.exists()) return
+        try {
+            val bytes = f.readBytes()
+            if (bytes.size != ThermalRenderer.N * 2) { f.delete(); haveCalib = false; return }
+            val data = ShortArray(ThermalRenderer.N)
+            ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(data)
+            NativeRenderer.calibSet(data)
+            haveCalib = true
+        } catch (_: Throwable) {}
     }
 
     private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
@@ -667,12 +751,12 @@ class MainActivity : AppCompatActivity() {
         cross(c, cx, cy, 6f, 30f)
         if (mode >= 2) outlined(c, "L ${stats[4]}", cx + 38f, cy - 8f)
         if (mode >= 3) {
-            val hx = (stats[0] % w).toFloat()
-            val hy = (stats[0] / w).toFloat()
+            val hx = (stats[1] % w).toFloat()
+            val hy = (stats[1] / w).toFloat()
             cross(c, hx, hy, 3f, 10f)
             outlined(c, "H ${stats[3]}", minOf(hx + 12f, w - 80f), maxOf(hy - 6f, 22f))
-            val lx = (stats[1] % w).toFloat()
-            val ly = (stats[1] / w).toFloat()
+            val lx = (stats[0] % w).toFloat()
+            val ly = (stats[0] / w).toFloat()
             cross(c, lx, ly, 3f, 10f)
             outlined(c, "C ${stats[2]}", minOf(lx + 12f, w - 80f), minOf(ly + 20f, ThermalDecoder.OUT_H - 6f))
         }
@@ -693,6 +777,7 @@ class MainActivity : AppCompatActivity() {
         val argb = if (nativeOk) null else IntArray(ThermalRenderer.N)
         val renderer = if (nativeOk) null else ThermalRenderer()
         val canvases = arrayOf(Canvas(bitmaps[0]), Canvas(bitmaps[1]))
+        if (nativeOk) loadCalibration()
 
         var shift = -1
         var badInRow = 0
@@ -708,6 +793,11 @@ class MainActivity : AppCompatActivity() {
                 relockRequest = false
                 if (nativeOk) NativeRenderer.resetNative()
                 renderer?.reset()
+            }
+            val req = calibRequest
+            if (nativeOk && req != 0) {
+                calibRequest = 0
+                if (req == 1) NativeRenderer.calibStart(CALIB_FRAMES) else NativeRenderer.calibClear()
             }
             val f = ready.poll(200, TimeUnit.MILLISECONDS) ?: continue
             try {
@@ -746,7 +836,12 @@ class MainActivity : AppCompatActivity() {
                 val t1: Long
                 val t2: Long
                 if (nativeOk) {
-                    NativeRenderer.renderNative(f, shift, tnr, contrast, palette, bmp, nativeStats)
+                    val wasCalib = calibLeft > 0
+                    NativeRenderer.renderNative(f, shift, tnr, contrast, sharp, palette, bmp, nativeStats)
+                    if (calibRequest == 0) {
+                        calibLeft = nativeStats[5]
+                        if (wasCalib && calibLeft == 0) saveCalibration()
+                    }
                     rendererMinPos = nativeStats[0]
                     rendererMaxPos = nativeStats[1]
                     rendererMinLevel = nativeStats[2]

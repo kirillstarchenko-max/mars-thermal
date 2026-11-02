@@ -16,16 +16,27 @@ object NativeRenderer {
     }
 
     /**
-     * Декодирует Y + применяет TNR/контраст/палитру + пишет прямо в Bitmap (RGBA_8888).
-     * @param stats IntArray(6): [minPos, maxPos, minLevel, maxLevel, centerLevel, 0]
+     * Декодирует Y + калибровка + TNR + резкость + контраст + палитра, пишет прямо в Bitmap (RGBA_8888).
+     * @param sharp резкость 0..3 (0 выкл)
+     * @param stats IntArray(6): [холодная поз., горячая поз., холодная, горячая, центр, осталось кадров калибровки]
      */
     external fun renderNative(
         frame: ByteArray, shift: Int,
-        tnr: Int, contrast: Int,
+        tnr: Int, contrast: Int, sharp: Int,
         palette: IntArray,
         bitmap: Bitmap,
         stats: IntArray
     )
 
     external fun resetNative()
+
+    /** Начать калибровку: следующие frames кадров усредняются, камера должна смотреть на ровную поверхность. */
+    external fun calibStart(frames: Int)
+
+    external fun calibClear()
+
+    /** Текущая поправка (ThermalRenderer.N значений) или false, если калибровки нет. */
+    external fun calibGet(out: ShortArray): Boolean
+
+    external fun calibSet(data: ShortArray)
 }
