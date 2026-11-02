@@ -164,6 +164,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         JNIEnv* env, jobject /*thiz*/,
         jbyteArray frame_, jint shift,
         jint tnr, jint contrast, jint sharp, jboolean destripe,
+        jint zoomQ, jint cropX, jint cropY, jint aimX, jint aimY,
         jintArray pal_,
         jobject bitmap,
         jintArray stats_) {
@@ -296,9 +297,11 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         hist2[v]++;
     }
 
-    // 6) Выравнивание (plateau) или прямое отображение
+    // 6) Мягкое выравнивание или прямое отображение. Камера уже сама выровняла картинку, поэтому
+    //    полное выравнивание поверх даёт ступеньки и шум: ограничиваем пики гистограммы средним
+    //    и смешиваем результат пополам с обычной шкалой.
     if (contrast == 2) {
-        const int cap = std::max(1, 2 * N / 256);
+        const int cap = std::max(1, N / 256);
         long long total = 0;
         for (int b = 0; b < 256; ++b) {
             if (hist2[b] > cap) hist2[b] = cap;
@@ -307,7 +310,8 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         long long run = 0;
         for (int b = 0; b < 256; ++b) {
             run += hist2[b];
-            float target = (total > 0) ? (float)run * 255.0f / (float)total : (float)b;
+            float eq = (total > 0) ? (float)run * 255.0f / (float)total : (float)b;
+            float target = 0.5f * (float)b + 0.5f * eq;
             eqLut[b] += 0.2f * (target - eqLut[b]);
             int m = (int)eqLut[b];
             if (m < 0) m = 0; else if (m > 255) m = 255;
@@ -348,14 +352,35 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     }
 
     // 8) Палитра -> Bitmap (RGBA_8888: в памяти ABGR little-endian)
+    uint32_t lut[256];
+    for (int b = 0; b < 256; ++b) {
+        uint32_t c = (uint32_t)pal[b];
+        lut[b] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFF) | ((c & 0xFF) << 16);
+    }
     uint32_t* out = (uint32_t*)pixels;
-    for (int i = 0; i < N; ++i) {
-        uint32_t c = (uint32_t)pal[idx[i]];
-        uint32_t a = (c >> 24) & 0xFF;
-        uint32_t r = (c >> 16) & 0xFF;
-        uint32_t g = (c >> 8) & 0xFF;
-        uint32_t b = c & 0xFF;
-        out[i] = (a << 24) | (b << 16) | (g << 8) | r;
+    if (zoomQ <= 256) {
+        for (int i = 0; i < N; ++i) out[i] = lut[idx[i]];
+    } else {
+        // цифровой зум: окно WIDTH/z x OUT_H/z вокруг (cropX, cropY), билинейная интерполяция уровней
+        const int inv = (int)((65536LL * 256) / zoomQ);         // шаг по исходнику, 16.16
+        const int maxX = (WIDTH - 1) << 16, maxY = (OUT_H - 1) << 16;
+        for (int Y = 0; Y < OUT_H; ++Y) {
+            int sy = (cropY << 16) + (Y - OUT_H / 2) * inv + inv / 2 - 32768;
+            sy = std::clamp(sy, 0, maxY);
+            const int y0 = sy >> 16, fy = (sy >> 8) & 0xFF;
+            const uint8_t* r0 = idx + y0 * WIDTH;
+            const uint8_t* r1 = idx + std::min(y0 + 1, OUT_H - 1) * WIDTH;
+            uint32_t* o = out + Y * WIDTH;
+            for (int X = 0; X < WIDTH; ++X) {
+                int sx = (cropX << 16) + (X - WIDTH / 2) * inv + inv / 2 - 32768;
+                sx = std::clamp(sx, 0, maxX);
+                const int x0 = sx >> 16, fx = (sx >> 8) & 0xFF;
+                const int x1 = std::min(x0 + 1, WIDTH - 1);
+                const int top = r0[x0] * (256 - fx) + r0[x1] * fx;
+                const int bot = r1[x0] * (256 - fx) + r1[x1] * fx;
+                o[X] = lut[(top * (256 - fy) + bot * fy + 32768) >> 16];
+            }
+        }
     }
 
     // 9) Метрики для прицела
@@ -365,7 +390,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         stats[1] = spotFind(mxI, mxV, true);
         stats[2] = (mnV + 8) >> 4;
         stats[3] = (mxV + 8) >> 4;
-        int ci = (OUT_H / 2) * WIDTH + WIDTH / 2;
+        int ci = std::clamp((int)aimY, 0, OUT_H - 1) * WIDTH + std::clamp((int)aimX, 0, WIDTH - 1);
         stats[4] = (blur[ci] + 8) >> 4;
         stats[5] = 0;
         env->SetIntArrayRegion(stats_, 0, 6, stats);

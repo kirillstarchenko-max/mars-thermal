@@ -21,6 +21,20 @@ object Palettes {
 
     private val cache = HashMap<Int, IntArray>()
 
+    /**
+     * Подсветка горячего (изотерма): ниже порога приглушённая ч/б картинка, от порога и выше —
+     * от красного к жёлтому. Цель видна сразу на любом фоне.
+     */
+    fun isotherm(threshold: Int): IntArray = IntArray(256) { k ->
+        if (k < threshold) {
+            val g = k * 200 / 255
+            0xFF000000.toInt() or (g shl 16) or (g shl 8) or g
+        } else {
+            val t = if (threshold >= 255) 255 else (k - threshold) * 255 / (255 - threshold)
+            0xFF000000.toInt() or (0xFF shl 16) or (t shl 8) or (t / 4)
+        }
+    }
+
     /** 256 цветов ARGB для палитры idx; invert разворачивает палитру. */
     fun get(idx: Int, invert: Boolean): IntArray {
         val i = ((idx % NAMES.size) + NAMES.size) % NAMES.size

@@ -29,6 +29,8 @@ import android.os.PowerManager
 import android.os.Process
 import android.provider.MediaStore
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -65,7 +67,17 @@ class MainActivity : AppCompatActivity() {
         const val REQ_COUNT = 16
         const val STALL_MS = 4000L
         private val CONTRAST_NAMES = arrayOf("как у камеры", "авто", "выравнивание")
-        private val RETICLE_NAMES = arrayOf("выкл", "перекрестие", "+ значение", "+ горячая/холодная")
+        private val SHAPE_NAMES = arrayOf("выкл", "крест", "крест+точка", "точка", "круг", "дальномер")
+        private val COLOR_NAMES = arrayOf("белый", "красный", "зелёный", "жёлтый", "голубой")
+        private val COLOR_VALUES = intArrayOf(
+            Color.WHITE, Color.rgb(255, 40, 40), Color.rgb(40, 255, 60), Color.rgb(255, 230, 0), Color.rgb(0, 220, 255))
+        private val LABEL_NAMES = arrayOf("выкл", "значение", "+ горячая/холодная")
+        private val HL_NAMES = arrayOf("выкл", "верх 5%", "верх 15%", "верх 30%")
+        private val HL_THRESHOLD = intArrayOf(256, 242, 217, 178)
+        private val ZOOM_STEPS = floatArrayOf(1f, 2f, 4f)
+        const val ZOOM_MAX = 4f
+        const val AIM_MAX_X = 200            // предел пристрелки, пикселей кадра
+        const val AIM_MAX_Y = 160
         private val SHARP_NAMES = arrayOf("выкл", "слабая", "средняя", "сильная")
         private val VIEW_NAMES = arrayOf("вписать", "на весь экран", "растянуть")
         private val ROTATE_NAMES = arrayOf("авто", "горизонт.", "вертик.")
@@ -86,10 +98,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnPal: Button
     private lateinit var btnContrast: Button
     private lateinit var btnNoise: Button
-    private lateinit var btnReticle: Button
+    private lateinit var btnShape: Button
+    private lateinit var btnLabels: Button
+    private lateinit var btnHighlight: Button
+    private lateinit var btnZoom: Button
+    private lateinit var btnZero: Button
+    private lateinit var btnRec: Button
+    private lateinit var zeroPanel: LinearLayout
+    private lateinit var zeroLabel: TextView
     private lateinit var btnSharp: Button
     private lateinit var btnView: Button
-    private lateinit var btnStripes: Button
     private lateinit var btnRotate: Button
     private lateinit var buttons: List<Button>
     private lateinit var btnInfo: Button
@@ -97,12 +115,23 @@ class MainActivity : AppCompatActivity() {
     // настройки отображения
     @Volatile private var palIdx = 0
     @Volatile private var invert = false
-    @Volatile private var contrast = 1
+    @Volatile private var contrast = 0
     @Volatile private var tnr = 2
-    @Volatile private var reticle = 1
+    @Volatile private var retShape = 1
+    @Volatile private var retColor = 0
+    @Volatile private var labels = 0
+    @Volatile private var highlight = 0
+    @Volatile private var zoom = 1f
+    @Volatile private var aimX = 0            // пристрелка: сдвиг точки прицеливания от центра, пикселей кадра
+    @Volatile private var aimY = 0
+    @Volatile private var zeroing = false
+    @Volatile private var recRequest = 0      // 1 начать запись, 2 остановить (выполняет поток обработки)
+    @Volatile private var recording = false
+    @Volatile private var recStartMs = 0L
+    private var pinched = false
     @Volatile private var showInfo = false
     @Volatile private var sharp = 1
-    @Volatile private var destripe = true
+    @Volatile private var destripe = false
     private var viewMode = 0
     private var rotateMode = 0
     @Volatile private var palette: IntArray = Palettes.get(0, false)
@@ -194,19 +223,27 @@ class MainActivity : AppCompatActivity() {
         prefs = getPreferences(Context.MODE_PRIVATE)
         palIdx = prefs.getInt("pal", 0)
         invert = prefs.getBoolean("invert", false)
-        contrast = prefs.getInt("contrast", 1)
+        contrast = prefs.getInt("contrast", 0)
         tnr = prefs.getInt("tnr", 2)
-        reticle = prefs.getInt("reticle", 1)
+        // раньше был один «Прицел» 0..3: переносим в форму сетки и метки
+        val oldReticle = prefs.getInt("reticle", 1)
+        retShape = prefs.getInt("ret_shape", if (oldReticle == 0) 0 else 1).coerceIn(0, SHAPE_NAMES.size - 1)
+        retColor = prefs.getInt("ret_color", 0).coerceIn(0, COLOR_NAMES.size - 1)
+        labels = prefs.getInt("labels", (oldReticle - 1).coerceIn(0, 2)).coerceIn(0, LABEL_NAMES.size - 1)
+        highlight = prefs.getInt("highlight", 0).coerceIn(0, HL_NAMES.size - 1)
+        zoom = prefs.getFloat("zoom", 1f).coerceIn(1f, ZOOM_MAX)
+        aimX = prefs.getInt("aim_x", 0)
+        aimY = prefs.getInt("aim_y", 0)
         showInfo = prefs.getBoolean("info", false)
         sharp = prefs.getInt("sharp", 1)
         viewMode = prefs.getInt("view", 0)
-        destripe = prefs.getBoolean("destripe", true)
+        destripe = prefs.getBoolean("destripe", false)
         rotateMode = prefs.getInt("rotate", 0).coerceIn(0, ROTATE_MODES.size - 1)
         requestedOrientation = ROTATE_MODES[rotateMode]
         // калибровки больше нет: убираем её старые файлы
         java.io.File(filesDir, "calib.bin").delete()
         java.io.File(filesDir, "calib2.bin").delete()
-        palette = Palettes.get(palIdx, invert)
+        palette = currentPalette()
 
         image = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
@@ -232,18 +269,62 @@ class MainActivity : AppCompatActivity() {
         }
         btnPal = makeButton({ cyclePalette(1) }, { invert = !invert; applySettings() })
         btnContrast = makeButton({ contrast = (contrast + 1) % CONTRAST_NAMES.size; applySettings() })
-        btnNoise = makeButton({ tnr = (tnr + 1) % 5; applySettings() })
+        btnNoise = makeButton({ tnr = (tnr + 1) % 5; applySettings() }, {
+            destripe = !destripe
+            applySettings()
+            toast(if (destripe) "Подавление полос включено" else "Подавление полос выключено")
+        })
         btnSharp = makeButton({ sharp = (sharp + 1) % SHARP_NAMES.size; applySettings() })
-        btnReticle = makeButton({ reticle = (reticle + 1) % RETICLE_NAMES.size; applySettings() })
+        btnShape = makeButton({ retShape = (retShape + 1) % SHAPE_NAMES.size; applySettings() },
+            { retColor = (retColor + 1) % COLOR_NAMES.size; applySettings() })
+        btnLabels = makeButton({ labels = (labels + 1) % LABEL_NAMES.size; applySettings() })
+        btnHighlight = makeButton({ highlight = (highlight + 1) % HL_NAMES.size; applySettings() })
+        btnZoom = makeButton({ zoom = nextZoomStep(zoom); applySettings() }, { zoom = 1f; applySettings() })
+        btnZero = makeButton({ zeroing = !zeroing; refreshButtons() })
+        btnRec = makeButton({ recRequest = if (recording) 2 else 1 })
         btnView = makeButton({ viewMode = (viewMode + 1) % VIEW_NAMES.size; applySettings() })
-        btnStripes = makeButton({ destripe = !destripe; applySettings() })
         val btnSnap = makeButton({ takeSnapshot() })
         btnSnap.text = "Снимок"
         btnInfo = makeButton({ showInfo = !showInfo; dumps = 0; applySettings() })
         btnRotate = makeButton({ rotateMode = (rotateMode + 1) % ROTATE_MODES.size; applySettings() })
-        buttons = listOf(btnPal, btnContrast, btnNoise, btnSharp, btnReticle,
-            btnView, btnStripes, btnRotate, btnSnap, btnInfo)
+        buttons = listOf(btnPal, btnContrast, btnNoise, btnSharp, btnShape, btnLabels, btnHighlight,
+            btnZoom, btnView, btnRotate, btnZero, btnSnap, btnRec, btnInfo)
         layoutBar()
+
+        // панель пристрелки: стрелки двигают точку прицеливания на 1 пиксель кадра, долгое нажатие — на 10
+        zeroLabel = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setPadding(16, 8, 16, 8)
+        }
+        zeroPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(0xAA000000.toInt())
+            visibility = View.GONE
+        }
+        zeroPanel.addView(zeroLabel)
+        for ((label, dx, dy) in listOf(Triple("◀", -1, 0), Triple("▶", 1, 0), Triple("▲", 0, -1), Triple("▼", 0, 1))) {
+            zeroPanel.addView(makeButton({ moveAim(dx, dy) }, { moveAim(dx * 10, dy * 10) }).apply { text = label },
+                LinearLayout.LayoutParams(120, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        zeroPanel.addView(makeButton({ aimX = 0; aimY = 0; applySettings() }).apply { text = "Сброс" })
+        zeroPanel.addView(makeButton({ zeroing = false; refreshButtons() }).apply { text = "Готово" })
+
+        // щипок двумя пальцами — плавный зум; одиночное касание по-прежнему прячет/показывает кнопки
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(d: ScaleGestureDetector): Boolean {
+                zoom = (zoom * d.scaleFactor).coerceIn(1f, ZOOM_MAX)
+                refreshButtons()
+                return true
+            }
+            override fun onScaleEnd(d: ScaleGestureDetector) = applySettings()
+        })
+        image.setOnTouchListener { _, e ->
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) pinched = false
+            scaleDetector.onTouchEvent(e)
+            if (e.pointerCount > 1 || scaleDetector.isInProgress) pinched = true
+            pinched
+        }
         image.setOnClickListener {
             bar.visibility = if (bar.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         }
@@ -257,6 +338,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(infoView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.TOP or Gravity.START).apply { topMargin = 70 })
+        root.addView(zeroPanel, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END))
         root.addView(bar, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         setContentView(root)
@@ -275,11 +359,11 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /** Кнопки в одну строку в альбомной ориентации и в две — в книжной, чтобы не сжимались. */
+    /** Кнопки в два ряда в альбомной ориентации и в три — в книжной, чтобы не сжимались. */
     private fun layoutBar() {
         val portrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
         bar.removeAllViews()
-        for (row in buttons.chunked(if (portrait) 5 else buttons.size)) {
+        for (row in buttons.chunked(if (portrait) 5 else 7)) {
             val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             for (b in row) {
                 (b.parent as? ViewGroup)?.removeView(b)
@@ -312,11 +396,25 @@ class MainActivity : AppCompatActivity() {
         applySettings()
     }
 
+    private fun currentPalette(): IntArray =
+        if (highlight > 0) Palettes.isotherm(HL_THRESHOLD[highlight]) else Palettes.get(palIdx, invert)
+
+    private fun nextZoomStep(z: Float): Float = ZOOM_STEPS.firstOrNull { it > z + 0.05f } ?: 1f
+
+    private fun moveAim(dx: Int, dy: Int) {
+        aimX = (aimX + dx).coerceIn(-AIM_MAX_X, AIM_MAX_X)
+        aimY = (aimY + dy).coerceIn(-AIM_MAX_Y, AIM_MAX_Y)
+        applySettings()
+    }
+
     private fun applySettings() {
-        palette = Palettes.get(palIdx, invert)
+        palette = currentPalette()
         prefs.edit()
             .putInt("pal", palIdx).putBoolean("invert", invert).putInt("contrast", contrast)
-            .putInt("tnr", tnr).putInt("reticle", reticle).putBoolean("info", showInfo)
+            .putInt("tnr", tnr).putBoolean("info", showInfo)
+            .putInt("ret_shape", retShape).putInt("ret_color", retColor).putInt("labels", labels)
+            .putInt("highlight", highlight).putFloat("zoom", zoom)
+            .putInt("aim_x", aimX).putInt("aim_y", aimY)
             .putInt("sharp", sharp).putInt("view", viewMode).putBoolean("destripe", destripe)
             .putInt("rotate", rotateMode)
             .apply()
@@ -327,12 +425,18 @@ class MainActivity : AppCompatActivity() {
     private fun refreshButtons() {
         btnPal.text = "Палитра: ${Palettes.NAMES[palIdx]}${if (invert) " (инв.)" else ""}"
         btnContrast.text = "Контраст: ${CONTRAST_NAMES[contrast]}"
-        btnNoise.text = "Шумоподавл.: ${if (tnr == 0) "выкл" else tnr.toString()}"
+        btnNoise.text = "Шумоподавл.: ${if (tnr == 0) "выкл" else tnr.toString()}${if (destripe) " +полосы" else ""}"
         btnSharp.text = "Резкость: ${SHARP_NAMES[sharp]}"
-        btnReticle.text = "Прицел: ${RETICLE_NAMES[reticle]}"
+        btnShape.text = "Сетка: ${SHAPE_NAMES[retShape]}, ${COLOR_NAMES[retColor]}"
+        btnLabels.text = "Метки: ${LABEL_NAMES[labels]}"
+        btnHighlight.text = "Подсветка: ${HL_NAMES[highlight]}"
+        btnZoom.text = "Зум: %.1fx".format(zoom)
+        btnZero.text = if (zeroing) "Пристрелка: идёт" else "Пристрелка"
+        btnRec.text = if (recording) "■ Стоп" else "● Запись"
+        zeroPanel.visibility = if (zeroing) View.VISIBLE else View.GONE
+        zeroLabel.text = "X %+d  Y %+d".format(aimX, aimY)
         btnView.text = "Вид: ${VIEW_NAMES[viewMode]}"
         btnInfo.text = if (showInfo) "Инфо: вкл" else "Инфо: выкл"
-        btnStripes.text = if (destripe) "Полосы: убирать" else "Полосы: оставить"
         btnRotate.text = "Поворот: ${ROTATE_NAMES[rotateMode]}"
         image.scaleType = VIEW_SCALE[viewMode]
     }
@@ -676,6 +780,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val retLine = Paint().apply { strokeWidth = 2f; isAntiAlias = true; style = Paint.Style.STROKE }
+    private val retEdge = Paint().apply { strokeWidth = 5f; isAntiAlias = true; style = Paint.Style.STROKE }
+    private val retDot = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
+    private val retDotEdge = Paint().apply { isAntiAlias = true; style = Paint.Style.FILL }
     private val whiteLine = Paint().apply {
         color = Color.WHITE; strokeWidth = 2f; isAntiAlias = true; style = Paint.Style.STROKE
     }
@@ -694,6 +802,7 @@ class MainActivity : AppCompatActivity() {
         c.drawText(s, x, y, textFill)
     }
 
+    /** Маленький белый крестик (горячая/холодная точка). */
     private fun cross(c: Canvas, cx: Float, cy: Float, gap: Float, arm: Float) {
         for (p in arrayOf(blackLine, whiteLine)) {
             c.drawLine(cx - arm, cy, cx - gap, cy, p)
@@ -703,43 +812,70 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun drawOverlay(c: Canvas, mode: Int, r: ThermalRenderer) {
-        if (mode <= 0) return
-        val w = ThermalDecoder.WIDTH
-        val cx = w / 2f
-        val cy = ThermalDecoder.OUT_H / 2f
-        cross(c, cx, cy, 6f, 30f)
-        if (mode >= 2) outlined(c, "L ${r.centerLevel}", cx + 38f, cy - 8f)
-        if (mode >= 3) {
-            val hx = (r.maxPos % w).toFloat()
-            val hy = (r.maxPos / w).toFloat()
-            cross(c, hx, hy, 3f, 10f)
-            outlined(c, "H ${r.maxLevel}", minOf(hx + 12f, w - 80f), maxOf(hy - 6f, 22f))
-            val lx = (r.minPos % w).toFloat()
-            val ly = (r.minPos / w).toFloat()
-            cross(c, lx, ly, 3f, 10f)
-            outlined(c, "C ${r.minLevel}", minOf(lx + 12f, w - 80f), minOf(ly + 20f, ThermalDecoder.OUT_H - 6f))
+    /** Прицельная сетка выбранной формы и цвета с контрастной обводкой. */
+    private fun drawReticle(c: Canvas, x: Float, y: Float, shape: Int, color: Int) {
+        val edge = if (color == Color.BLACK) Color.WHITE else Color.BLACK
+        retLine.color = color; retDot.color = color
+        retEdge.color = edge; retDotEdge.color = edge
+        for (p in arrayOf(retEdge, retLine)) {
+            val dotPaint = if (p === retEdge) retDotEdge else retDot
+            val grow = if (p === retEdge) 1.5f else 0f
+            fun arms(gap: Float, arm: Float) {
+                c.drawLine(x - arm, y, x - gap, y, p)
+                c.drawLine(x + gap, y, x + arm, y, p)
+                c.drawLine(x, y - arm, x, y - gap, p)
+                c.drawLine(x, y + gap, x, y + arm, p)
+            }
+            when (shape) {
+                1 -> arms(6f, 30f)
+                2 -> { arms(9f, 40f); c.drawCircle(x, y, 2f + grow, dotPaint) }
+                3 -> c.drawCircle(x, y, 3f + grow, dotPaint)
+                4 -> { c.drawCircle(x, y, 22f, p); c.drawCircle(x, y, 1.6f + grow, dotPaint) }
+                5 -> {
+                    // дальномерная: длинные нити с рисками через 20 пикселей
+                    arms(6f, 160f)
+                    var d = 20f
+                    while (d <= 160f) {
+                        val t = if (d % 100f == 0f) 8f else 4f
+                        c.drawLine(x - d, y - t, x - d, y + t, p)
+                        c.drawLine(x + d, y - t, x + d, y + t, p)
+                        c.drawLine(x - t, y + d, x + t, y + d, p)
+                        d += 20f
+                    }
+                }
+            }
         }
     }
 
-    private fun drawOverlayNative(c: Canvas, mode: Int, stats: IntArray) {
-        if (mode <= 0) return
+    /**
+     * Сетка, значение и горячая/холодная точки поверх готового кадра. Координаты кадра (до зума)
+     * переводятся в экранные: зум z вокруг точки (cropX, cropY).
+     */
+    private fun drawOverlay(c: Canvas, z: Float, cropX: Int, cropY: Int,
+                            coldPos: Int, hotPos: Int, coldLvl: Int, hotLvl: Int, aimLvl: Int) {
         val w = ThermalDecoder.WIDTH
-        val cx = w / 2f
-        val cy = ThermalDecoder.OUT_H / 2f
-        cross(c, cx, cy, 6f, 30f)
-        if (mode >= 2) outlined(c, "L ${stats[4]}", cx + 38f, cy - 8f)
-        if (mode >= 3) {
-            val hx = (stats[1] % w).toFloat()
-            val hy = (stats[1] / w).toFloat()
-            cross(c, hx, hy, 3f, 10f)
-            outlined(c, "H ${stats[3]}", minOf(hx + 12f, w - 80f), maxOf(hy - 6f, 22f))
-            val lx = (stats[0] % w).toFloat()
-            val ly = (stats[0] / w).toFloat()
-            cross(c, lx, ly, 3f, 10f)
-            outlined(c, "C ${stats[2]}", minOf(lx + 12f, w - 80f), minOf(ly + 20f, ThermalDecoder.OUT_H - 6f))
+        val h = ThermalDecoder.OUT_H
+        fun sx(px: Float) = (px - cropX) * z + w / 2f
+        fun sy(py: Float) = (py - cropY) * z + h / 2f
+        val ax = sx(w / 2f + aimX)
+        val ay = sy(h / 2f + aimY)
+        val shape = if (retShape == 0 && zeroing) 1 else retShape
+        drawReticle(c, ax, ay, shape, COLOR_VALUES[retColor])
+        if (labels >= 1) outlined(c, "L $aimLvl", minOf(ax + 38f, w - 80f), maxOf(ay - 8f, 22f))
+        if (labels >= 2) {
+            for ((pos, tag, lvl, below) in listOf(
+                    Quad(hotPos, "H", hotLvl, false), Quad(coldPos, "C", coldLvl, true))) {
+                val x = sx((pos % w).toFloat())
+                val y = sy((pos / w).toFloat())
+                if (x < 0 || x >= w || y < 0 || y >= h) continue     // точка за краем увеличенного кадра
+                cross(c, x, y, 3f, 10f)
+                val ty = if (below) minOf(y + 20f, h - 6f) else maxOf(y - 6f, 22f)
+                outlined(c, "$tag $lvl", minOf(x + 12f, w - 80f), ty)
+            }
         }
     }
+
+    private data class Quad(val pos: Int, val tag: String, val lvl: Int, val below: Boolean)
 
     private fun workerBody() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
@@ -756,7 +892,24 @@ class MainActivity : AppCompatActivity() {
         val argb = if (nativeOk) null else IntArray(ThermalRenderer.N)
         val renderer = if (nativeOk) null else ThermalRenderer()
         val canvases = arrayOf(Canvas(bitmaps[0]), Canvas(bitmaps[1]))
+        val recorder = VideoRecorder(this)
+        try {
+            processLoop(nativeOk, y, argb, renderer, canvases, recorder, hint)
+        } finally {
+            if (recorder.active) finishRecording(recorder)
+        }
+    }
 
+    private fun finishRecording(recorder: VideoRecorder) {
+        val name = recorder.fileName
+        val ok = recorder.stop()
+        recording = false
+        runOnUiThread { refreshButtons() }
+        toast(if (ok) "Видео сохранено: Movies/MarsThermal/$name" else "Видео не записалось")
+    }
+
+    private fun processLoop(nativeOk: Boolean, y: ByteArray?, argb: IntArray?, renderer: ThermalRenderer?,
+                            canvases: Array<Canvas>, recorder: VideoRecorder, hint: Any?) {
         var shift = -1
         var badInRow = 0
         var cur = 0
@@ -765,6 +918,22 @@ class MainActivity : AppCompatActivity() {
         var fpsText = ""
 
         while (running) {
+            when (recRequest) {
+                1 -> {
+                    recRequest = 0
+                    if (recorder.start()) {
+                        recording = true
+                        recStartMs = System.currentTimeMillis()
+                    } else {
+                        toast("Запись не началась: ${recorder.lastError}")
+                    }
+                    runOnUiThread { refreshButtons() }
+                }
+                2 -> {
+                    recRequest = 0
+                    finishRecording(recorder)
+                }
+            }
             if (relockRequest) {
                 shift = -1
                 badInRow = 0
@@ -808,8 +977,23 @@ class MainActivity : AppCompatActivity() {
                 cur = 1 - cur
                 val t1: Long
                 val t2: Long
+                // зум вокруг точки прицеливания; окно не выходит за край кадра (Kotlin-рендер без зума)
+                val w = ThermalDecoder.WIDTH
+                val h = ThermalDecoder.OUT_H
+                val z = if (nativeOk) zoom else 1f
+                val aimPx = w / 2 + aimX
+                val aimPy = h / 2 + aimY
+                var cropX = w / 2
+                var cropY = h / 2
+                if (z > 1.01f) {
+                    val hw = (w / 2f / z).toInt()
+                    val hh = (h / 2f / z).toInt()
+                    cropX = aimPx.coerceIn(hw, w - hw)
+                    cropY = aimPy.coerceIn(hh, h - hh)
+                }
                 if (nativeOk) {
-                    NativeRenderer.renderNative(f, shift, tnr, contrast, sharp, destripe, palette, bmp, nativeStats)
+                    NativeRenderer.renderNative(f, shift, tnr, contrast, sharp, destripe,
+                        (z * 256).toInt(), cropX, cropY, aimPx, aimPy, palette, bmp, nativeStats)
                     rendererMinPos = nativeStats[0]
                     rendererMaxPos = nativeStats[1]
                     rendererMinLevel = nativeStats[2]
@@ -817,14 +1001,24 @@ class MainActivity : AppCompatActivity() {
                     rendererCenterLevel = nativeStats[4]
                     t1 = System.nanoTime()
                     t2 = System.nanoTime()
-                    drawOverlayNative(cv, reticle, nativeStats)
+                    drawOverlay(cv, z, cropX, cropY, nativeStats[0], nativeStats[1], nativeStats[2],
+                        nativeStats[3], nativeStats[4])
                 } else {
                     ThermalDecoder.decodeY(f, shift, y!!)
                     t1 = System.nanoTime()
                     renderer!!.render(y, tnr, contrast, palette, argb!!)
                     t2 = System.nanoTime()
                     bmp.setPixels(argb, 0, ThermalDecoder.WIDTH, 0, 0, ThermalDecoder.WIDTH, ThermalDecoder.OUT_H)
-                    drawOverlay(cv, reticle, renderer)
+                    drawOverlay(cv, 1f, cropX, cropY, renderer.minPos, renderer.maxPos, renderer.minLevel,
+                        renderer.maxLevel, renderer.centerLevel)
+                }
+                if (recording) {
+                    try {
+                        recorder.frame(bmp)
+                    } catch (t: Throwable) {
+                        lastErr = "запись: $t"
+                        finishRecording(recorder)
+                    }
                 }
                 lastBmp = bmp
                 val t3 = System.nanoTime()
@@ -844,7 +1038,10 @@ class MainActivity : AppCompatActivity() {
                     fpsCount = 0
                     tWin = now
                 }
-                val text = fpsText
+                val text = if (recording) {
+                    val sec = (System.currentTimeMillis() - recStartMs) / 1000
+                    "$fpsText  ● REC %d:%02d".format(sec / 60, sec % 60)
+                } else fpsText
                 runOnUiThread {
                     image.setImageBitmap(bmp)
                     if (text.isNotEmpty()) msgView.text = text
