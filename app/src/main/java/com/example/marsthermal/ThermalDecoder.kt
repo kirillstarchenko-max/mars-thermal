@@ -20,7 +20,7 @@ object ThermalDecoder {
 
     private const val PAD_LEVEL = 235
     private const val PAD_TOL = 25
-    private const val FLAT_RANGE = 400
+    private const val FLAT_RANGE = 800
     private const val HEADER_RANGE = 20000
 
     // результат последнего rowStats (поток обработки один, поэтому без синхронизации)
@@ -104,16 +104,17 @@ object ThermalDecoder {
     /** Строгая проверка кадра при данном сдвиге: служебные строки плоские, последняя (заголовок) «живая». */
     fun frameOk(f: ByteArray, shift: Int): Boolean {
         var bad = 0
+        // Разрешаем до 10% «грязных» служебных строк (например, от ярких объектов)
+        val maxBad = maxOf(2, OUT_H / 10)
         for (r in 0 until OUT_H) {
             if (!padFlat(f, shift + r * ROW)) {
-                bad++
-                if (bad > 2) return false
+               bad++
+               if (bad > maxBad) return false
             }
         }
         rowStats(f, shift + OUT_H * ROW)
         return rMax - rMin > HEADER_RANGE
     }
-
     /** Текстовая диагностика для экрана «Инфо»: сколько строк плоские и чем плох кадр. */
     fun diagnose(f: ByteArray, shift: Int): String {
         var flat = 0
