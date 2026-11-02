@@ -68,7 +68,7 @@ class MainActivity : AppCompatActivity() {
         private val VIEW_SCALE = arrayOf(
             ImageView.ScaleType.FIT_CENTER, ImageView.ScaleType.CENTER_CROP, ImageView.ScaleType.FIT_XY)
         const val CALIB_FRAMES = 32         // ~1 с усреднения
-        const val CALIB_FILE = "calib.bin"
+        const val CALIB_FILE = "calib2.bin"     // узор матрицы без плавных перепадов (calib.bin был старый формат)
     }
 
     private lateinit var usb: UsbManager
@@ -139,7 +139,8 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var rendererMinLevel = 0
     @Volatile private var rendererMaxLevel = 0
     @Volatile private var rendererCenterLevel = 0
-    private val nativeStats = IntArray(6)
+    private val nativeStats = IntArray(8)
+    @Volatile private var calibAlpha = -1
 
     private val bitmaps = arrayOf(
         Bitmap.createBitmap(ThermalDecoder.WIDTH, ThermalDecoder.OUT_H, Bitmap.Config.ARGB_8888),
@@ -156,6 +157,7 @@ class MainActivity : AppCompatActivity() {
                         "показано ${shown.get()}\n" +
                         "срывов ${relocks.get()} | брак ${rejected.get()} | переподк. ${recoveries.get()}\n" +
                         "время: разбор %.1f | обработка %.1f | вывод %.1f мс\n".format(tDec, tRen, tUi) +
+                        (if (calibAlpha >= 0) "калибровка: сила поправки %.2f\n".format(calibAlpha / 100.0) else "") +
                         (if (lastReject.isNotEmpty()) "последний брак: $lastReject\n" else "") +
                         (if (lastErr.isNotEmpty()) "ОШИБКА: $lastErr" else "")
             } else {
@@ -195,6 +197,7 @@ class MainActivity : AppCompatActivity() {
         showInfo = prefs.getBoolean("info", false)
         sharp = prefs.getInt("sharp", 1)
         viewMode = prefs.getInt("view", 0)
+        java.io.File(filesDir, "calib.bin").delete()
         haveCalib = calibFile().exists()
         palette = Palettes.get(palIdx, invert)
 
@@ -317,7 +320,7 @@ class MainActivity : AppCompatActivity() {
         calibRequest = 1
         calibLeft = CALIB_FRAMES
         refreshCalibButton()
-        toast("Наведите камеру на ровную стену или закройте объектив, держите ~1 с")
+        toast("Наведите камеру на ровную стену без предметов (или закройте объектив), держите ~1 с")
     }
 
     private fun clearCalibration() {
@@ -840,8 +843,12 @@ class MainActivity : AppCompatActivity() {
                     NativeRenderer.renderNative(f, shift, tnr, contrast, sharp, palette, bmp, nativeStats)
                     if (calibRequest == 0) {
                         calibLeft = nativeStats[5]
-                        if (wasCalib && calibLeft == 0) saveCalibration()
+                        if (wasCalib && calibLeft == 0) {
+                            if (nativeStats[7] < 0) toast("В кадре были предметы — калибровка не принята, наведите на ровную стену")
+                            else saveCalibration()
+                        }
                     }
+                    calibAlpha = nativeStats[6]
                     rendererMinPos = nativeStats[0]
                     rendererMaxPos = nativeStats[1]
                     rendererMinLevel = nativeStats[2]
