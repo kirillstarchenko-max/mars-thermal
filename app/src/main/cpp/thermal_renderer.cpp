@@ -7,7 +7,6 @@
 
 extern "C" {
 
-// Константы потока
 static const int WIDTH = 640;
 static const int OUT_H = 512;
 static const int ROW = 1280;
@@ -16,9 +15,8 @@ static const int VALUES = ROWS * ROW;          // 656640
 static const int FRAME_BYTES = VALUES * 2;     // 1313280
 static const int N = OUT_H * WIDTH;            // 327680
 
-// Состояние рендерера (аналог ThermalRenderer.kt)
-static int acc[N];          // Y*16, временной фильтр
-static uint8_t idx[N];      // индексы 0..255 после контраста
+static int acc[N];
+static uint8_t idx[N];
 static int hist[256];
 static int hist2[256];
 static int map256[256];
@@ -27,14 +25,9 @@ static bool haveAcc = false;
 static bool haveRange = false;
 static float loF = 0.0f;
 static float hiF = 255.0f;
+static float prevAvgY = -1.0f;
 
-// Вес нового кадра (из 256) для уровней TNR 0..4
 static const int BASE_ALPHA[5] = {256, 150, 100, 64, 30};
-
-// Вспомогательная: Y (байт) -> 16-битный «уровень» для TNR
-static inline int yByte(const uint8_t* f, int wordIndex) {
-    return f[(wordIndex << 1) + 1];
-}
 
 JNIEXPORT void JNICALL
 Java_com_example_marsthermal_NativeRenderer_renderNative(
@@ -69,8 +62,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     int mnI = 0, mxI = 0;
     const bool first = !haveAcc;
 
-    // 1) Временной фильтр + гистограмма + экстремумы
-    //    Декодируем Y в том же проходе: shift задаёт начало кадра в словах
+    // 1) Временной фильтр + гистограмма + экстремумы (декодирование Y в один проход)
     for (int r = 0; r < OUT_H; ++r) {
         int p = (shift + r * ROW + WIDTH) % VALUES;
         const int dst = r * WIDTH;
@@ -103,7 +95,18 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     }
     haveAcc = true;
 
-    // 2) Границы диапазона
+    // 1.5) Сброс TNR при резком изменении сцены (появление неба/монитора)
+    long long sumY = 0;
+    for (int i = 0; i < N; ++i) sumY += (acc[i] >> 4);
+    float avgY = (float)sumY / (float)N;
+    if (prevAvgY >= 0.0f && fabsf(avgY - prevAvgY) > 8.0f) {
+        // сцена резко изменилась — TNR стартует заново
+        haveAcc = false;
+        haveRange = false;
+    }
+    prevAvgY = avgY;
+
+    // 2) Границы диапазона (быстрое сглаживание)
     float newLo = 0.0f, newHi = 255.0f;
     if (contrast != 0) {
         const float loT = N * 0.01f;
@@ -119,8 +122,9 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     if (!haveRange) {
         loF = newLo; hiF = newHi; haveRange = true;
     } else {
-        loF += 0.12f * (newLo - loF);
-        hiF += 0.12f * (newHi - hiF);
+        // было 0.12f — теперь 0.5f: быстрее догоняет новые границы
+        loF += 0.5f * (newLo - loF);
+        hiF += 0.5f * (newHi - hiF);
     }
     float span = hiF - loF;
     if (span < 12.0f) {
@@ -161,11 +165,9 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         for (int b = 0; b < 256; ++b) map256[b] = b;
     }
 
-    // 5) Палитра -> Bitmap (RGBA_8888: в памяти это ABGR little-endian)
+    // 5) Палитра -> Bitmap (RGBA_8888: в памяти ABGR little-endian)
     uint32_t* out = (uint32_t*)pixels;
     for (int i = 0; i < N; ++i) {
-        // pal[] из Kotlin: 0xAARRGGBB. В памяти Bitmap RGBA_8888 ожидает R,G,B,A по байтам,
-        // что при чтении как uint32_t little-endian даёт 0xAABBGGRR. Поэтому переставляем R и B.
         uint32_t c = (uint32_t)pal[map256[idx[i]]];
         uint32_t a = (c >> 24) & 0xFF;
         uint32_t r = (c >> 16) & 0xFF;
@@ -174,7 +176,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         out[i] = (a << 24) | (b << 16) | (g << 8) | r;
     }
 
-    // 6) Метрики для прицела (center/min/max)
+    // 6) Метрики для прицела
     if (stats_ != nullptr) {
         jint stats[6];
         stats[0] = mnI;
@@ -192,11 +194,11 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
     env->ReleaseIntArrayElements(pal_, pal, JNI_ABORT);
 }
 
-// Сброс состояния (при пересинхронизации)
 JNIEXPORT void JNICALL
 Java_com_example_marsthermal_NativeRenderer_resetNative(JNIEnv*, jobject) {
     haveAcc = false;
     haveRange = false;
+    prevAvgY = -1.0f;
     for (int i = 0; i < 256; ++i) eqLut[i] = (float)i;
 }
 
