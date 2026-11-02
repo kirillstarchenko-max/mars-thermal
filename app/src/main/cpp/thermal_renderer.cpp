@@ -54,6 +54,54 @@ static const int CORE = 2;             // перепады до 2 уровней
 static const int BORDER = 4;           // края кадра у камеры с мусором: экстремумы там не ищем
 static const int SPOT_R = 32;          // окно уточнения горячей/холодной точки, пикселей
 
+/*
+ * Битые пиксели: пиксель, который кадр за кадром резко отличается почти от всех 8 соседей (от 6 и больше
+ * в одну сторону), набирает «подозрительность»; после ~3 с подряд он считается битым и заменяется
+ * средним здоровых соседей. Край предмета так не выделяется (на краю половина соседей похожа), а
+ * движущаяся сцена не держит одну точку долго. Карта учится сама на каждой камере и не сбрасывается
+ * при пересинхронизации: битый пиксель — свойство матрицы.
+ */
+static const int DEAD_T = 12 * 16;          // отличие от соседа, Y*16
+static const int DEAD_ON = 200;             // порог «битый» (+2 за кадр: ~100 кадров)
+static const int DEAD_OFF = 100;            // ниже — снова здоровый (гистерезис)
+static uint8_t deadScore[N];
+static uint8_t deadMap[N];
+static int deadCount = 0;
+
+static void fixDeadPixels() {
+    static const int NB[8] = {-WIDTH - 1, -WIDTH, -WIDTH + 1, -1, 1, WIDTH - 1, WIDTH, WIDTH + 1};
+    for (int r = 1; r < OUT_H - 1; ++r) {
+        for (int j = 1; j < WIDTH - 1; ++j) {
+            const int i = r * WIDTH + j;
+            const int v = disp[i];
+            int pos = 0, neg = 0;
+            for (int k = 0; k < 8; ++k) {
+                const int d = v - disp[i + NB[k]];
+                if (d > DEAD_T) ++pos; else if (d < -DEAD_T) ++neg;
+            }
+            int sc = deadScore[i];
+            if (pos >= 6 || neg >= 6) sc = std::min(255, sc + 2);
+            else if (sc > 0) --sc;
+            deadScore[i] = (uint8_t)sc;
+            if (sc >= DEAD_ON) deadMap[i] = 1;
+            else if (sc < DEAD_OFF) deadMap[i] = 0;
+        }
+    }
+    // замена: соседи-битые не участвуют, поэтому замена на месте не влияет на соседние пиксели
+    int count = 0;
+    for (int i = WIDTH; i < N - WIDTH; ++i) {
+        if (!deadMap[i]) continue;
+        ++count;
+        int sum = 0, n = 0;
+        for (int k = 0; k < 8; ++k) {
+            const int q = i + NB[k];
+            if (!deadMap[q]) { sum += disp[q]; ++n; }
+        }
+        if (n > 0) disp[i] = sum / n;
+    }
+    deadCount = count;
+}
+
 static int medianOf(int* a, int n) {
     std::nth_element(a, a + n / 2, a + n);
     return a[n / 2];
@@ -199,6 +247,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
             if (p == VALUES) p = 0;
         }
     }
+    fixDeadPixels();
     if (destripe) estimateStripes();
     else haveStripe = false;
 
@@ -392,7 +441,7 @@ Java_com_example_marsthermal_NativeRenderer_renderNative(
         stats[3] = (mxV + 8) >> 4;
         int ci = std::clamp((int)aimY, 0, OUT_H - 1) * WIDTH + std::clamp((int)aimX, 0, WIDTH - 1);
         stats[4] = (blur[ci] + 8) >> 4;
-        stats[5] = 0;
+        stats[5] = deadCount;
         env->SetIntArrayRegion(stats_, 0, 6, stats);
     }
 

@@ -19,7 +19,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Запись MP4 (H.264, аппаратный кодер) в Movies/MarsThermal. Кадры — готовые Bitmap с сеткой и метками,
+ * Запись MP4 (H.264, аппаратный кодер) в Movies/MaroderTherm. Кадры — готовые Bitmap с сеткой и метками,
  * их рисуем на входную поверхность кодера. Все вызовы из одного потока (потока обработки).
  */
 class VideoRecorder(private val ctx: Context) {
@@ -52,11 +52,11 @@ class VideoRecorder(private val ctx: Context) {
     fun start(): Boolean {
         if (Build.VERSION.SDK_INT < 29) { lastError = "нужен Android 10+"; return false }
         try {
-            fileName = "mars_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+            fileName = "maroder_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                 put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/MarsThermal")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/MaroderTherm")
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
             val u = ctx.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)

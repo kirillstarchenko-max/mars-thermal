@@ -175,6 +175,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var rendererMaxLevel = 0
     @Volatile private var rendererCenterLevel = 0
     private val nativeStats = IntArray(6)
+    @Volatile private var deadPixels = 0
 
     private val bitmaps = arrayOf(
         Bitmap.createBitmap(ThermalDecoder.WIDTH, ThermalDecoder.OUT_H, Bitmap.Config.ARGB_8888),
@@ -191,6 +192,7 @@ class MainActivity : AppCompatActivity() {
                         "показано ${shown.get()}\n" +
                         "срывов ${relocks.get()} | брак ${rejected.get()} | переподк. ${recoveries.get()}\n" +
                         "время: разбор %.1f | обработка %.1f | вывод %.1f мс\n".format(tDec, tRen, tUi) +
+                        "битых пикселей заменено: $deadPixels\n" +
                         (if (lastReject.isNotEmpty()) "последний брак: $lastReject\n" else "") +
                         (if (lastErr.isNotEmpty()) "ОШИБКА: $lastErr" else "")
             } else {
@@ -453,16 +455,16 @@ class MainActivity : AppCompatActivity() {
         thread(name = "snapshot") {
             try {
                 val big = Bitmap.createScaledBitmap(copy, 1280, 1024, true)
-                val name = "mars_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".png"
+                val name = "maroder_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".png"
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, name)
                     put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/MarsThermal")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/MaroderTherm")
                 }
                 val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                 if (uri != null) {
                     contentResolver.openOutputStream(uri)?.use { big.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                    toast("Сохранено: Pictures/MarsThermal/$name")
+                    toast("Сохранено: Pictures/MaroderTherm/$name")
                 } else {
                     toast("Не удалось сохранить снимок")
                 }
@@ -478,7 +480,7 @@ class MainActivity : AppCompatActivity() {
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)
                 put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/MarsThermal")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/MaroderTherm")
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
             contentResolver.openOutputStream(uri)?.use { it.write(f, 0, ThermalDecoder.FRAME_BYTES) }
@@ -905,7 +907,7 @@ class MainActivity : AppCompatActivity() {
         val ok = recorder.stop()
         recording = false
         runOnUiThread { refreshButtons() }
-        toast(if (ok) "Видео сохранено: Movies/MarsThermal/$name" else "Видео не записалось")
+        toast(if (ok) "Видео сохранено: Movies/MaroderTherm/$name" else "Видео не записалось")
     }
 
     private fun processLoop(nativeOk: Boolean, y: ByteArray?, argb: IntArray?, renderer: ThermalRenderer?,
@@ -999,6 +1001,7 @@ class MainActivity : AppCompatActivity() {
                     rendererMinLevel = nativeStats[2]
                     rendererMaxLevel = nativeStats[3]
                     rendererCenterLevel = nativeStats[4]
+                    deadPixels = nativeStats[5]
                     t1 = System.nanoTime()
                     t2 = System.nanoTime()
                     drawOverlay(cv, z, cropX, cropY, nativeStats[0], nativeStats[1], nativeStats[2],

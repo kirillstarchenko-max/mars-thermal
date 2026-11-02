@@ -21,7 +21,7 @@ object NativeRenderer {
      * @param destripe убирать полосы по столбцам/строкам
      * @param zoomQ цифровой зум *256 (256 = без зума), окно вокруг (cropX, cropY) в пикселях кадра
      * @param aimX точка прицеливания в пикселях кадра: в ней меряется уровень stats[4]
-     * @param stats IntArray(6): [холодная поз., горячая поз., холодная, горячая, в точке прицеливания, 0]
+     * @param stats IntArray(6): [холодная поз., горячая поз., холодная, горячая, в точке прицеливания, битых пикселей]
      */
     external fun renderNative(
         frame: ByteArray, shift: Int,
